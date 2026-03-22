@@ -1,11 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
+from starlette.requests import Request
 from .extractor import extract_bill_data
 from .schemas import FinalResponse
-import os
 import logging
 import requests
 import asyncio
@@ -19,6 +18,8 @@ logger = logging.getLogger(__name__)
 MAX_UPLOAD_SIZE_MB = 20
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 ALLOWED_URL_SCHEMES = {"http", "https"}
+ZERO_TOKEN_USAGE = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+EMPTY_DATA_BLOCK = {"pagewise_line_items": [], "total_item_count": 0}
 
 app = FastAPI(
     title="Automated Bill Extraction System",
@@ -35,32 +36,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-from starlette.requests import Request
+def _base_response(is_success: bool, data: dict | None = None, error: str | None = None) -> dict:
+    response = {
+        "is_success": is_success,
+        "token_usage": ZERO_TOKEN_USAGE.copy(),
+        "data": data if data is not None else EMPTY_DATA_BLOCK.copy(),
+    }
+    if error:
+        response["error"] = error
+    return response
 
 @app.exception_handler(Exception)
 async def universal_exception_handler(request: Request, exc: Exception):
     logger.error("Error while extracting: %s", exc)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "is_success": False,
-            "token_usage": {
-                "total_tokens": 0,
-                "input_tokens": 0,
-                "output_tokens": 0
-            },
-            "data": {
-                "pagewise_line_items": [],
-                "total_item_count": 0
-            },
-            "error": "Internal server error"
-        }
-    )
+    return JSONResponse(status_code=500, content=_base_response(False, error="Internal server error"))
 
 class BillRequest(BaseModel):
     document: str
@@ -77,16 +67,12 @@ class BillRequest(BaseModel):
         return v
 
 
-def _failure_response() -> dict:
+def _failure_response(error_message: str = "Extraction failed") -> dict:
     """Standard failure response to avoid duplication."""
-    return {
-        "is_success": False,
-        "token_usage": {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0},
-        "data": {"pagewise_line_items": [], "total_item_count": 0},
-    }
+    return _base_response(False, error=error_message)
 
 
-def safe_float(value):
+def safe_float(value) -> float:
     """Converts anything to float safely."""
     try:
         if value is None:
@@ -95,9 +81,31 @@ def safe_float(value):
     except (ValueError, TypeError):
         return 0.0
 
-def build_response(result):
+
+def _normalize_item(item: dict) -> dict:
+    return {
+        "item_name": item.get("item_name", "") or "",
+        "item_amount": safe_float(item.get("item_amount")),
+        "item_rate": safe_float(item.get("item_rate")),
+        "item_quantity": safe_float(item.get("item_quantity")),
+    }
+
+
+def _normalize_page(page: dict) -> dict:
+    items = page.get("bill_items", [])
+    if not isinstance(items, list):
+        items = []
+
+    safe_items = [_normalize_item(item) for item in items if isinstance(item, dict)]
+    return {
+        "page_no": str(page.get("page_no", "1")),
+        "page_type": page.get("page_type", "Bill Detail"),
+        "bill_items": safe_items,
+    }
+
+
+def build_response(result: dict | None):
     """Fully safe wrapper for hackathon API."""
-    
     if not isinstance(result, dict):
         result = {}
 
@@ -105,48 +113,11 @@ def build_response(result):
     if not isinstance(pages, list):
         pages = []
 
-    page_entries = []
-
-    for page in pages:
-        if not isinstance(page, dict):
-            continue
-
-        items = page.get("bill_items", [])
-        if not isinstance(items, list):
-            items = []
-
-        safe_items = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            safe_items.append({
-                "item_name": item.get("item_name", "") or "",
-                "item_amount": safe_float(item.get("item_amount")),
-                "item_rate": safe_float(item.get("item_rate")),
-                "item_quantity": safe_float(item.get("item_quantity")),
-            })
-
-        page_entries.append({
-            "page_no": str(page.get("page_no", "1")),
-            "page_type": page.get("page_type", "Bill Detail"),
-            "bill_items": safe_items
-        })
+    page_entries = [_normalize_page(page) for page in pages if isinstance(page, dict)]
 
     total_items = sum(len(p["bill_items"]) for p in page_entries)
-
-    return {
-        "is_success": True,
-        "token_usage": {
-            "total_tokens": 0,
-            "input_tokens": 0,
-            "output_tokens": 0
-        },
-        "data": {
-            "pagewise_line_items": page_entries,
-            "total_item_count": total_items
-        }
-    }
+    data_block = {"pagewise_line_items": page_entries, "total_item_count": total_items}
+    return _base_response(True, data=data_block)
 
 def download_file_sync(url: str):
     """Synchronous download function to be run in executor."""
@@ -196,7 +167,7 @@ async def extract_bill(request: BillRequest):
 
     except Exception as e:
         logger.error("FAILURE: Failed to extract from document: %s. Error: %s", request.document, e)
-        return _failure_response()
+        return _failure_response(str(e))
 
 
 @app.post("/extract-from-file", response_model=FinalResponse)
@@ -220,12 +191,12 @@ async def extract_from_file(file: UploadFile = File(...)):
         raise
     except Exception as e:
         logger.error("FAILURE: Failed to extract from file: %s. Error: %s", file.filename, e)
-        return _failure_response()
+        return _failure_response(str(e))
 
 
 @app.get("/")
 async def read_index():
-    return FileResponse(os.path.join(STATIC_DIR, 'index.html'))
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health")

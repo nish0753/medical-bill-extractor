@@ -25,3 +25,4 @@ class FinalResponse(BaseModel):
     is_success: bool
     token_usage: TokenUsage
     data: DataBlock
+    error: Optional[str] = None

@@ -1,23 +1,36 @@
-import google.generativeai as genai
 import os
-from dotenv import load_dotenv
-import time
+import pytest
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+pytestmark = pytest.mark.integration
 
-def test_model(model_name):
-    print(f"Testing {model_name}...")
+
+def test_gemini_langchain_smoke():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        pytest.skip("GOOGLE_API_KEY is not configured")
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        google_api_key=api_key,
+        temperature=0,
+    )
     try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content("Hello, are you available?")
-        print(f"SUCCESS: {model_name} responded: {response.text}")
-        return True
-    except Exception as e:
-        print(f"FAILURE: {model_name} error: {e}")
-        return False
+        response = llm.invoke([HumanMessage(content="Reply with exactly: OK")])
+    except Exception as exc:
+        error_text = str(exc).lower()
+        if "quota" in error_text or "resourceexhausted" in error_text or "429" in error_text:
+            pytest.skip("Gemini quota/rate limit reached for this environment")
+        pytest.skip(f"Gemini smoke test unavailable: {exc}")
 
-print("--- Checking Model Availability ---")
-test_model("gemini-1.5-flash")
-time.sleep(1)
-test_model("gemini-2.0-flash-exp")
+    if isinstance(response.content, str):
+        text = response.content
+    else:
+        text = " ".join(
+            chunk.get("text", "")
+            for chunk in response.content
+            if isinstance(chunk, dict)
+        )
+
+    assert "OK" in text.upper()

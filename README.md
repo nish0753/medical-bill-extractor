@@ -1,91 +1,253 @@
-# Automated Bill Extraction System 🧾
+# Automated Bill Extraction System
 
-> **A High-Precision, Hybrid AI Pipeline for extracting structured data from complex medical bills.**
+Production-ready FastAPI service that extracts structured line items from bill images and PDFs using a hybrid OCR + LLM pipeline.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.95%2B-green)
-![Gemini](https://img.shields.io/badge/AI-Gemini%202.0%20Flash-orange)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-green)
+![LangChain](https://img.shields.io/badge/LangChain-Enabled-2a7f62)
+![Gemini](https://img.shields.io/badge/Google-Gemini%202.5%20Flash-orange)
 ![Docker](https://img.shields.io/badge/Deployment-Docker-blue)
 
-## 🚀 Overview
+## Purpose
 
-This project solves the challenge of extracting line-item details from unstructured and complex PDF bills. Unlike traditional OCR or regex parsers that break on layout changes, this system uses a **Hybrid Multimodal Pipeline** combining:
-1.  **Visual Understanding**: Google Gemini 2.0 Flash (Multimodal LLM).
-2.  **Textual Precision**: Tesseract OCR (for raw text validation).
+Medical bills and invoices are semi-structured and vary across providers. This service accepts a bill document URL or uploaded file, extracts itemized lines, and returns normalized JSON in a fixed response schema.
 
-It is designed for **Robustness**, **Accuracy**, and **Scalability**.
+## End-to-End Execution Flow
 
-## ✨ Key Features
+```mermaid
+flowchart TD
+    A[Client Request] --> B{Endpoint}
+    B -->|POST /extract-bill-data| C[Download file from URL]
+    B -->|POST /extract-from-file| D[Read uploaded bytes]
+    C --> E[Normalize MIME type]
+    D --> E
+    E --> F{PDF or Image?}
+    F -->|PDF| G[Convert pages with pdf2image]
+    F -->|Image| H[Preprocess with Pillow]
+    G --> I[OCR with Tesseract optional]
+    H --> I
+    I --> J[Build page batches]
+    J --> K[LangGraph workflow orchestration]
+    K --> L[LangChain + Gemini structured extraction]
+    L --> M{Quota or model issue?}
+    M -->|Yes| N[Retry + fallback models]
+    M -->|No| O[Aggregate page results]
+    N --> O
+    O --> P[Normalize schema + safe numeric casting]
+    P --> Q[Final JSON response]
+```
 
-*   **🧠 Hybrid "Golden Standard" Pipeline**: Fuses Visual Layout analysis (Gemini) with Raw Text extraction (Tesseract) to eliminate hallucinations.
-*   **🛡️ Self-Healing JSON**: Integrated `json_repair` layer automatically fixes malformed API responses, ensuring 0% parse errors.
-*   **⚡ Smart Batching**: Intelligently splits large multi-page PDFs into safe batches (Sequential Processing) to respect API rate limits and token windows.
-*   **🔌 Magic Byte Detection**: Automatically detects PDF files even if the server returns incorrect MIME types (e.g., `application/octet-stream`).
-*   **🐳 Dockerized**: Fully containerized with all system dependencies (`poppler`, `tesseract`) for seamless cloud deployment.
+## Internal Extraction Workflow (Detailed)
 
-## 🛠️ Tech Stack
+```mermaid
+flowchart TD
+    A[extract_bill_data receives bytes + mime_type] --> B[Normalize content type]
+    B --> C{Magic bytes indicate PDF?}
+    C -->|Yes| D[Force mime_type to application/pdf]
+    C -->|No| E[Keep original mime_type]
+    D --> F
+    E --> F
+    F[LangGraph start: prepare_pages node] --> G{Document type}
 
-*   **Core Engine**: Google Gemini 2.0 Flash
-*   **OCR Engine**: Tesseract OCR
-*   **Backend Framework**: FastAPI (Async)
-*   **Image Processing**: `pdf2image`, `Pillow`
-*   **Deployment**: Docker, Render.com
+    G -->|PDF| H[convert_from_bytes at configured DPI]
+    H --> I[For each page: optional OCR + JPEG payload]
 
-## 🚀 Live Demo
+    G -->|Image| J[preprocess_image via Pillow]
+    J --> K[optional OCR + single JPEG payload]
 
-**Base URL**: `https://nishant-nit-patna.onrender.com`
+    I --> L[build_batches node]
+    K --> L
+    L --> M[Chunk pages by BATCH_SIZE]
+    M --> N[extract_batches node]
 
-### API Endpoint
-`POST /extract-bill-data`
+    N --> O[call_gemini_api_async]
+    O --> P{USE_MOCK_MODE true?}
+    P -->|Yes| Q[Return mock extraction]
+    P -->|No| R[Build multimodal prompt]
 
-**Curl Example:**
+    R --> S[Try primary model]
+    S --> T{Success?}
+    T -->|Yes| U[Return structured output]
+    T -->|No| V{Quota/429 or model limit?}
+    V -->|Retryable| W[Exponential backoff + retry]
+    W --> S
+    V -->|Model exhausted| X[Try fallback model]
+    X --> S
+
+    Q --> Y[validate_aggregate node]
+    U --> Y
+    Y --> Z[Merge pagewise_line_items + recompute total_item_count]
+    Z --> AA[Return normalized result to API layer]
+```
+
+## Technology Map (Where Each Tech Is Used)
+
+| Stage              | Technology                                    | Why it is used                                              |
+| ------------------ | --------------------------------------------- | ----------------------------------------------------------- |
+| API layer          | FastAPI, Pydantic                             | Request validation, response schema, async endpoints        |
+| Networking         | requests                                      | Download remote documents from URL input                    |
+| File understanding | MIME normalization + PDF magic-byte detection | Reliable type detection even for incorrect headers          |
+| PDF handling       | pdf2image                                     | Convert PDF pages to images for multimodal extraction       |
+| Image enhancement  | Pillow                                        | Improve image quality before OCR/model call                 |
+| OCR context        | pytesseract                                   | Extra textual signal for noisy or low-quality pages         |
+| Orchestration      | LangGraph                                     | Stepwise pipeline: prepare -> batch -> extract -> aggregate |
+| LLM integration    | LangChain + ChatGoogleGenerativeAI            | Structured extraction via Gemini with typed output          |
+| Model resilience   | Retry + fallback model list                   | Better behavior under rate limit/quota pressure             |
+| Packaging          | Docker, render.yaml                           | Deployable service for cloud runtime                        |
+| Quality            | pytest                                        | Unit and API behavior validation                            |
+
+## API Overview
+
+### 1) Health
+
+- Method: GET
+- Path: /health
+- Purpose: Liveness/version check
+
+Example:
+
 ```bash
-curl -X POST "https://nishant-nit-patna.onrender.com/extract-bill-data" \
-     -H "Content-Type: application/json" \
-     -d '{"document": "https://hackrx.blob.core.windows.net/assets/datathon-IIT/sample_1.png"}'
+curl http://127.0.0.1:8000/health
 ```
 
-## 📦 Installation & Local Run
+### 2) Extract from URL
 
-1.  **Clone the Repo:**
-    ```bash
-    git clone https://github.com/nish0753/Nishant_NIT_PATNA.git
-    cd Nishant_NIT_PATNA
-    ```
+- Method: POST
+- Path: /extract-bill-data
+- Input: JSON with document URL
 
-2.  **Install Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: You also need `tesseract-ocr` and `poppler-utils` installed on your system)*
+Request:
 
-3.  **Set Environment Variables:**
-    Create a `.env` file:
-    ```bash
-    GOOGLE_API_KEY=your_gemini_api_key_here
-    ```
-
-4.  **Run the Server:**
-    ```bash
-    python -m uvicorn app.main:app --reload
-    ```
-
-## 📂 Project Structure
-
+```json
+{
+  "document": "https://example.com/bill.pdf"
+}
 ```
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/extract-bill-data \
+  -H "Content-Type: application/json" \
+  -d '{"document":"https://example.com/bill.pdf"}'
+```
+
+### 3) Extract from File Upload
+
+- Method: POST
+- Path: /extract-from-file
+- Input: multipart/form-data with file
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/extract-from-file \
+  -F "file=@/absolute/path/to/bill.pdf"
+```
+
+### Response Shape
+
+```json
+{
+  "is_success": true,
+  "token_usage": {
+    "total_tokens": 0,
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "data": {
+    "pagewise_line_items": [
+      {
+        "page_no": "1",
+        "page_type": "Bill Detail",
+        "bill_items": [
+          {
+            "item_name": "Sample",
+            "item_amount": 100.0,
+            "item_rate": 100.0,
+            "item_quantity": 1.0
+          }
+        ]
+      }
+    ],
+    "total_item_count": 1
+  },
+  "error": null
+}
+```
+
+## Setup and Run
+
+### 1) Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+System dependencies required for PDF/OCR:
+
+- poppler-utils
+- tesseract-ocr
+
+### 2) Configure environment
+
+Create .env in the project root:
+
+```env
+GOOGLE_API_KEY=your_google_api_key
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL_FALLBACKS=gemini-flash-latest,gemini-2.0-flash
+MAX_RETRIES=10
+BATCH_SIZE=2
+PDF_DPI=200
+USE_MOCK_MODE=false
+```
+
+### 3) Start the API
+
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Swagger UI:
+
+- http://127.0.0.1:8000/docs
+
+## Project Structure
+
+```text
 .
-├── app/
-│   ├── main.py          # FastAPI Entrypoint & Routes
-│   ├── extractor.py     # Core Hybrid Pipeline Logic
-│   └── schemas.py       # Pydantic Models
-├── tests/               # Test Scripts
-├── Dockerfile           # Production Docker Setup
-├── keep_alive.py        # Utility to keep Render awake
-├── requirements.txt     # Python Dependencies
-└── README.md            # Documentation
+|-- app/
+|   |-- main.py          # FastAPI routes, request/response normalization
+|   |-- extractor.py     # Hybrid extraction pipeline + LangGraph workflow
+|   `-- schemas.py       # Pydantic output models
+|-- tests/
+|   |-- test_api.py      # Endpoint and validation tests
+|   |-- test_unit.py     # Utility and workflow behavior tests
+|   `-- test_models.py   # Integration smoke tests for model access
+|-- Dockerfile
+|-- render.yaml
+|-- requirements.txt
+|-- pytest.ini
+`-- README.md
 ```
 
-## 👨‍💻 Author
+## Testing
 
-**Nishant**
-*   **College**: NIT Patna
+```bash
+# Fast local signal (no external model dependency)
+pytest -q -m "not integration"
+
+# Full suite
+pytest -q
+```
+
+## Deployment Notes
+
+- The service is containerized via Dockerfile.
+- render.yaml is included for Render deployment.
+- If model quota is exhausted, extraction can fail unless USE_MOCK_MODE is set to true for demo/testing.
+
+## Achievement
+
+Rank 44 in Bajaj Finserv Datathon.

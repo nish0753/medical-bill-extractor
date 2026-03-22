@@ -1,32 +1,27 @@
 import os
 import requests
-import json
 import io
 import gc
 import shutil
-import glob
 import logging
 import asyncio
-import time
-import re
+import base64
+from typing import Any, TypedDict
 
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 from pdf2image import convert_from_bytes
+from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END
 
 try:
     import pytesseract as _pytesseract
 except ImportError:
     _pytesseract = None
 
-try:
-    import json_repair
-except ImportError:
-    json_repair = None
-
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Logging ---
 logger = logging.getLogger(__name__)
@@ -35,21 +30,227 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2"))
 PDF_DPI = int(os.getenv("PDF_DPI", "200"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+USE_MOCK_MODE = os.getenv("USE_MOCK_MODE", "false").lower() == "true"
+GEMINI_MODEL_FALLBACKS = [
+    model.strip()
+    for model in os.getenv("GEMINI_MODEL_FALLBACKS", "gemini-flash-latest,gemini-2.0-flash").split(",")
+    if model.strip()
+]
 
-# Configure Gemini
-GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Create model clients once (reuse across calls)
+_llm_cache: dict[tuple[str, str], ChatGoogleGenerativeAI] = {}
+_workflow = None
 
-# Create client once (reuse across calls)
-_client = None
 
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        if not GENAI_API_KEY:
-            raise RuntimeError("GOOGLE_API_KEY not found in environment variables.")
-        _client = genai.Client(api_key=GENAI_API_KEY)
-    return _client
+class LLMLineItem(BaseModel):
+    item_name: str = Field(default="")
+    item_amount: float = Field(default=0.0)
+    item_rate: float = Field(default=0.0)
+    item_quantity: float = Field(default=0.0)
+
+
+class LLMPageLineItems(BaseModel):
+    page_no: str = Field(default="1")
+    page_type: str = Field(default="Bill Detail")
+    bill_items: list[LLMLineItem] = Field(default_factory=list)
+
+
+class LLMExtractionOutput(BaseModel):
+    pagewise_line_items: list[LLMPageLineItems] = Field(default_factory=list)
+    total_item_count: int = Field(default=0)
+
+
+class BillExtractionState(TypedDict, total=False):
+    file_data: bytes
+    mime_type: str
+    pages: list[dict[str, Any]]
+    batches: list[dict[str, Any]]
+    batch_results: list[dict[str, Any]]
+    result: dict[str, Any]
+
+
+def _candidate_models() -> list[str]:
+    ordered = [GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS]
+    deduped: list[str] = []
+    for model in ordered:
+        if model not in deduped:
+            deduped.append(model)
+    return deduped
+
+
+def _get_llm(model_name: str) -> ChatGoogleGenerativeAI:
+    api_key = (os.getenv("GOOGLE_API_KEY") or "").strip().strip('"').strip("'")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY not found in environment variables.")
+
+    current_config = (api_key, model_name)
+    if current_config not in _llm_cache:
+        _llm_cache[current_config] = ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key,
+            temperature=0,
+            max_retries=0,
+        ).with_structured_output(LLMExtractionOutput)
+    return _llm_cache[current_config]
+
+
+async def _get_mock_response() -> dict[str, Any]:
+    """Return demo/mock bill extraction data for testing without API calls."""
+    return {
+        "pagewise_line_items": [
+            {
+                "page_no": "1",
+                "page_type": "Bill Detail",
+                "bill_items": [
+                    {"item_name": "Medical Consultation", "item_amount": 500.0, "item_rate": 500.0, "item_quantity": 1.0},
+                    {"item_name": "Lab Tests", "item_amount": 1200.0, "item_rate": 1200.0, "item_quantity": 1.0},
+                    {"item_name": "Medicines", "item_amount": 450.0, "item_rate": 450.0, "item_quantity": 1.0},
+                ]
+            }
+        ],
+        "total_item_count": 3
+    }
+
+
+async def _extract_ocr_text(image: Image.Image) -> str:
+    if not pytesseract:
+        return ""
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, pytesseract.image_to_string, image)
+    except Exception as exc:
+        logger.warning("OCR Warning: %s", exc)
+        return ""
+
+
+async def _prepare_pages_node(state: BillExtractionState) -> dict[str, Any]:
+    file_data = state["file_data"]
+    mime_type = state["mime_type"]
+
+    if mime_type == "application/pdf":
+        logger.info("PDF detected. Converting to images for batch processing.")
+        loop = asyncio.get_running_loop()
+        images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=PDF_DPI))
+        logger.info("PDF converted. Total pages: %d", len(images))
+
+        pages = []
+        for page_idx, image in enumerate(images, start=1):
+            page_ocr_text = await _extract_ocr_text(image)
+            page_ocr_context = ""
+            if page_ocr_text:
+                page_ocr_context = f"\n--- Page {page_idx} Raw OCR Text ---\n{page_ocr_text}\n"
+
+            with io.BytesIO() as output:
+                image.save(output, format="JPEG", quality=95)
+                pages.append(
+                    {
+                        "page_no": page_idx,
+                        "media_payload": ("image/jpeg", output.getvalue()),
+                        "ocr_context": page_ocr_context,
+                    }
+                )
+            image.close()
+
+        gc.collect()
+        return {"pages": pages}
+
+    if mime_type.startswith("image/"):
+        logger.info("Applying image preprocessing...")
+        loop = asyncio.get_running_loop()
+        processed_data = await loop.run_in_executor(None, preprocess_image, file_data)
+
+        page_ocr_context = ""
+        if pytesseract:
+            try:
+                image = Image.open(io.BytesIO(processed_data))
+                page_ocr_text = await _extract_ocr_text(image)
+                image.close()
+                if page_ocr_text:
+                    page_ocr_context = f"\n--- Page 1 Raw OCR Text ---\n{page_ocr_text}\n"
+            except Exception as exc:
+                logger.warning("OCR Warning: %s", exc)
+
+        return {
+            "pages": [
+                {
+                    "page_no": 1,
+                    "media_payload": ("image/jpeg", processed_data),
+                    "ocr_context": page_ocr_context,
+                }
+            ]
+        }
+
+    raise ValueError(f"Unsupported mime type for extraction: {mime_type}")
+
+
+async def _build_batches_node(state: BillExtractionState) -> dict[str, Any]:
+    pages = state.get("pages", [])
+    batches = []
+
+    for i in range(0, len(pages), BATCH_SIZE):
+        page_slice = pages[i : i + BATCH_SIZE]
+        media_payloads = [page["media_payload"] for page in page_slice]
+        ocr_context = "".join(page["ocr_context"] for page in page_slice if page.get("ocr_context"))
+        batches.append({"media_payloads": media_payloads, "ocr_context": ocr_context})
+
+    return {"batches": batches}
+
+
+async def _extract_batches_node(state: BillExtractionState) -> dict[str, Any]:
+    batches = state.get("batches", [])
+    batch_results = []
+
+    for idx, batch in enumerate(batches, start=1):
+        logger.info("Sending batch %d/%d with %d page(s) to Gemini...", idx, len(batches), len(batch["media_payloads"]))
+        batch_result = await call_gemini_api_async(batch["media_payloads"], batch.get("ocr_context", ""))
+        batch_results.append(batch_result)
+
+        if idx < len(batches):
+            await asyncio.sleep(1)
+
+    return {"batch_results": batch_results}
+
+
+async def _validate_and_aggregate_node(state: BillExtractionState) -> dict[str, Any]:
+    aggregated_pages: list[dict[str, Any]] = []
+    for batch_result in state.get("batch_results", []):
+        pages = batch_result.get("pagewise_line_items", [])
+        if isinstance(pages, list):
+            aggregated_pages.extend(page for page in pages if isinstance(page, dict))
+
+    total_item_count = sum(
+        len(page.get("bill_items", []))
+        for page in aggregated_pages
+        if isinstance(page.get("bill_items", []), list)
+    )
+
+    return {
+        "result": {
+            "pagewise_line_items": aggregated_pages,
+            "total_item_count": total_item_count,
+        }
+    }
+
+
+def _get_workflow():
+    global _workflow
+    if _workflow is None:
+        workflow = StateGraph(BillExtractionState)
+        workflow.add_node("prepare_pages", _prepare_pages_node)
+        workflow.add_node("build_batches", _build_batches_node)
+        workflow.add_node("extract_batches", _extract_batches_node)
+        workflow.add_node("validate_aggregate", _validate_and_aggregate_node)
+
+        workflow.set_entry_point("prepare_pages")
+        workflow.add_edge("prepare_pages", "build_batches")
+        workflow.add_edge("build_batches", "extract_batches")
+        workflow.add_edge("extract_batches", "validate_aggregate")
+        workflow.add_edge("validate_aggregate", END)
+        _workflow = workflow.compile()
+
+    return _workflow
 
 # --- Tesseract Setup ---
 def _setup_tesseract():
@@ -75,27 +276,6 @@ def _setup_tesseract():
     return None
 
 pytesseract = _setup_tesseract()
-
-def clean_json(text: str) -> str:
-    # Remove markdown code blocks
-    match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
-    if match:
-        text = match.group(1)
-    else:
-        # Try to find the first { and last }
-        start = text.find('{')
-        end = text.rfind('}')
-        if start != -1 and end != -1:
-            text = text[start:end+1]
-
-    # Fix missing commas between objects in a list: } { -> }, {
-    text = re.sub(r'}\s*{', '}, {', text)
-    
-    # Attempt to fix trailing commas
-    text = re.sub(r',\s*}', '}', text)
-    text = re.sub(r',\s*]', ']', text)
-    
-    return text
 
 def preprocess_image(image_bytes: bytes) -> bytes:
     """
@@ -131,7 +311,8 @@ def download_image(url: str) -> bytes:
         raise
 
 async def extract_bill_data(image_source, mime_type: str = None) -> dict:
-    if not GENAI_API_KEY:
+    api_key = (os.getenv("GOOGLE_API_KEY") or "").strip().strip('"').strip("'")
+    if not api_key:
         raise RuntimeError("GOOGLE_API_KEY not found in environment variables.")
 
     # 1. Get Raw Data
@@ -143,115 +324,30 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
         if not mime_type:
             raise ValueError("Mime type must be provided for file uploads.")
 
+    normalized_mime_type = (mime_type or "").split(";", 1)[0].strip().lower()
+    mime_type = normalized_mime_type or mime_type
+
     # 2. Magic Byte Detection (Fix for application/octet-stream)
     if file_data and len(file_data) > 4:
         if file_data[:4] == b'%PDF':
             logger.debug("Detected PDF magic bytes. Overriding mime_type '%s' to 'application/pdf'", mime_type)
             mime_type = 'application/pdf'
 
-    # 3. Prepare Content Parts (List of images) and OCR Context
-    content_parts = []
-    ocr_context = ""
-
-    if mime_type == 'application/pdf':
-        logger.info("PDF detected. Converting to images for batch processing.")
-        try:
-            loop = asyncio.get_running_loop()
-            images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=PDF_DPI))
-            logger.info("PDF converted. Total pages: %d", len(images))
-
-            # Smart Batching: Process pages in chunks to avoid Output Token Limit (8192)
-            
-            all_pagewise_items = []
-            total_item_count = 0
-            
-            # Prepare tasks for parallel execution
-            batch_tasks = []
-            
-            for i in range(0, len(images), BATCH_SIZE):
-                batch_images = images[i : i + BATCH_SIZE]
-                
-                batch_content_parts = []
-                batch_ocr_context = ""
-                
-                for j, image in enumerate(batch_images):
-                    page_num = i + j + 1
-                    
-                    if pytesseract:
-                        try:
-                            text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
-                            batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
-                        except Exception as e:
-                            logger.warning("OCR Warning on page %d: %s", page_num, e)
-
-                    with io.BytesIO() as output:
-                        image.save(output, format="JPEG", quality=95)
-                        img_bytes = output.getvalue()
-                        batch_content_parts.append(
-                            types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg')
-                        )
-                    image.close()
-
-                # Call Gemini for this batch
-                logger.info("Sending batch of %d page(s) to Gemini...", len(batch_content_parts))
-                batch_result = await call_gemini_api_async(batch_content_parts, batch_ocr_context)
-                
-                # Aggregate results
-                if batch_result:
-                    if "pagewise_line_items" in batch_result:
-                        all_pagewise_items.extend(batch_result["pagewise_line_items"])
-                    if "total_item_count" in batch_result:
-                        total_item_count += batch_result["total_item_count"]
-                
-                # Small delay to be nice to the API
-                await asyncio.sleep(1)
-
-            # Explicit GC
-            gc.collect()
-            
-            return {
-                "pagewise_line_items": all_pagewise_items,
-                "total_item_count": total_item_count
-            }
-
-        except Exception as e:
-            logger.error("PDF Processing Failed: %s", e)
-            raise
-    
-    elif mime_type.startswith('image/'):
-        logger.info("Applying image preprocessing...")
-        loop = asyncio.get_running_loop()
-        processed_data = await loop.run_in_executor(None, preprocess_image, file_data)
-        
-        # OCR for single image
-        if pytesseract:
-            try:
-                import PIL.Image
-                img_obj = PIL.Image.open(io.BytesIO(processed_data))
-                text = await loop.run_in_executor(None, pytesseract.image_to_string, img_obj)
-                ocr_context += f"\n--- Raw OCR Text ---\n{text}\n"
-            except Exception as e:
-                logger.warning("OCR Warning: %s", e)
-
-        content_parts.append(
-            types.Part.from_bytes(data=processed_data, mime_type='image/jpeg')
-        )
-        
-        # Single image call
-        return await call_gemini_api_async(content_parts, ocr_context)
-    
-    else:
-        # Fallback
-        content_parts.append(
-            types.Part.from_bytes(data=file_data, mime_type=mime_type)
-        )
-        return await call_gemini_api_async(content_parts, ocr_context)
+    workflow = _get_workflow()
+    final_state = await workflow.ainvoke({"file_data": file_data, "mime_type": mime_type})
+    return final_state.get("result", {"pagewise_line_items": [], "total_item_count": 0})
 
 
-async def call_gemini_api_async(content_parts, ocr_context=""):
-    """Call Gemini with a list of content parts and optional OCR context.
+async def call_gemini_api_async(media_payloads: list[tuple[str, bytes]], ocr_context: str = "") -> dict[str, Any]:
+    """Call Gemini through LangChain with media payloads and optional OCR context.
     Returns result_dict with extracted data."""
-    client = _get_client()
+    
+    # Return mock data if in demo mode (useful when API quota is exhausted)
+    if USE_MOCK_MODE:
+        logger.warning("MOCK MODE ENABLED: Returning sample bill data. Set USE_MOCK_MODE=false to use real API.")
+        return await _get_mock_response()
+    
+    model_errors: list[str] = []
     
     base_prompt = """
     You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice images.
@@ -287,119 +383,62 @@ async def call_gemini_api_async(content_parts, ocr_context=""):
     else:
         prompt = base_prompt
 
-    generation_config = types.GenerateContentConfig(
-        max_output_tokens=8192,
-        response_mime_type="application/json",
-        response_json_schema={
-            "type": "object",
-            "properties": {
-                "pagewise_line_items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "page_no": {"type": "string"},
-                            "page_type": {"type": "string"},
-                            "bill_items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "item_name": {"type": "string"},
-                                        "item_amount": {"type": "number"},
-                                        "item_rate": {"type": "number"},
-                                        "item_quantity": {"type": "number"}
-                                    },
-                                    "required": ["item_name", "item_amount", "item_rate", "item_quantity"]
-                                }
-                            }
-                        },
-                        "required": ["page_no", "page_type", "bill_items"]
-                    }
-                },
-                "total_item_count": {"type": "integer"}
-            },
-            "required": ["pagewise_line_items", "total_item_count"]
-        },
-        safety_settings=[
-            types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='OFF'),
-            types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='OFF'),
-            types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='OFF'),
-            types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='OFF'),
-        ],
-    )
+    content = []
+    for mime_type, media_bytes in media_payloads:
+        if mime_type.startswith("image/"):
+            base64_image = base64.b64encode(media_bytes).decode("utf-8")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": f"data:{mime_type};base64,{base64_image}",
+                }
+            )
+
+    content.append({"type": "text", "text": prompt})
 
     max_retries = MAX_RETRIES
-    for attempt in range(max_retries):
-        try:
-            # Construct the full prompt content: [img1, img2, ..., text_prompt]
-            full_content = content_parts + [prompt]
-            
-            response = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=full_content,
-                config=generation_config,
-            )
-            
+    for model_name in _candidate_models():
+        llm = _get_llm(model_name)
+        for attempt in range(max_retries):
             try:
-                text = response.text.strip()
-            except Exception:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                return {"pagewise_line_items": [], "total_item_count": 0}
+                response = await llm.ainvoke([HumanMessage(content=content)])
+                data_dict = response.model_dump()
 
-            text = clean_json(text)
-                
-            try:
-                data_dict = json.loads(text)
-                
-                # Recalculate total_item_count
-                total_count = 0
-                for page in data_dict.get("pagewise_line_items", []):
-                    for item in page.get("bill_items", []):
-                        total_count += 1
-                
-                data_dict['total_item_count'] = total_count
-                
+                total_count = sum(
+                    len(page.get("bill_items", []))
+                    for page in data_dict.get("pagewise_line_items", [])
+                )
+                data_dict["total_item_count"] = total_count
                 return data_dict
 
-            except json.JSONDecodeError as e:
-                logger.warning("JSON Parse Error: %s", e)
-                # Try robust repair
-                if json_repair:
-                    try:
-                        logger.debug("Attempting to repair JSON with json_repair...")
-                        data_dict = json_repair.loads(text)
-                    
-                        # Validate structure after repair
-                        if isinstance(data_dict, dict) and "pagewise_line_items" in data_dict:
-                            total_count = 0
-                            for page in data_dict.get("pagewise_line_items", []):
-                                for item in page.get("bill_items", []):
-                                    total_count += 1
-                            data_dict['total_item_count'] = total_count
-                            logger.info("JSON repair successful.")
-                            return data_dict
-                    except Exception as repair_e:
-                        logger.warning("JSON Repair Failed: %s", repair_e)
+            except Exception as e:
+                error_str = str(e)
+                is_quota_error = "429" in error_str or "Quota exceeded" in error_str or "ResourceExhausted" in error_str
+                is_model_zero_quota = is_quota_error and f"model: {model_name}" in error_str and "limit: 0" in error_str
 
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
-                    continue
-                raise
+                if is_model_zero_quota:
+                    logger.warning("Model %s quota is currently zero. Trying next fallback model.", model_name)
+                    model_errors.append(f"{model_name}: {error_str}")
+                    break
 
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "Quota exceeded" in error_str or "ResourceExhausted" in error_str:
-                if attempt < max_retries - 1:
-                    wait_time = min(5 * (2 ** attempt), 60)  # Cap at 60s
-                    logger.warning("Quota exceeded (Attempt %d/%d). Retrying in %ds...", attempt + 1, max_retries, wait_time)
+                if is_quota_error and attempt < max_retries - 1:
+                    wait_time = min(2 * (2 ** attempt), 10)
+                    logger.warning(
+                        "Quota exceeded for model %s (Attempt %d/%d). Retrying in %ds...",
+                        model_name,
+                        attempt + 1,
+                        max_retries,
+                        wait_time,
+                    )
                     await asyncio.sleep(wait_time)
                     continue
-            
-            logger.error("Gemini API Error: %s", e)
-            if attempt < max_retries - 1:
-                 await asyncio.sleep(2)
-                 continue
-            raise ValueError(f"Gemini API failed after {max_retries} attempts: {e}")
+
+                logger.error("Gemini API Error on model %s: %s", model_name, e)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                model_errors.append(f"{model_name}: {error_str}")
+
+    joined_errors = " | ".join(model_errors) if model_errors else "No model candidates succeeded"
+    raise ValueError(f"Gemini API failed across candidate models after retries: {joined_errors}")

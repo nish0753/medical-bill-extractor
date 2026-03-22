@@ -8,7 +8,6 @@ __pycache__/
 .idea/
 *.md
 *.html
-!app/static/index.html
 venv/
 .DS_Store
 *.log
@@ -17,8 +16,4 @@ results/
 result_*.json
 training_samples/
 tests/
-Interview_Prep/
-linkedin_post.md
-create_pdf.py
-keep_alive.py
 .gemini/
