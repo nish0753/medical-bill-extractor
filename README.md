@@ -114,23 +114,12 @@ Bills contain patient data, so all tracing goes through [`app/tracing.py`](app/t
 
 ## Evaluation
 
-The `eval/` harness scores any output against a hand-checked answer key of 15 real hospital bills (1,069 lines), kept outside the repository because it contains patient data. Lines are matched by page, exact amount and fuzzy item name.
+The `eval/` harness compares the pipeline's output with a hand-made answer key and reports line recall, line precision, amount accuracy and bill-total matches. Lines are matched by page, exact amount and fuzzy item name. The answer key and sample bills stay outside this repository because they contain patient data.
 
 ```bash
-python -m eval.run_baseline --out eval/outputs/my-run          # run the pipeline on all samples
+python -m eval.run_baseline --out eval/outputs/my-run          # run the pipeline on the samples
 python -m eval.run_eval --outputs eval/outputs/my-run --format legacy --label my-run --compare
 ```
-
-Baseline of the current pipeline, dev split:
-
-| Metric | Current | Target |
-|---|---|---|
-| Line recall | 65.0% | ≥ 97% (printed bills) |
-| Line precision | 67.4% | ≥ 98% |
-| Amount exact match | 97.1% | ≥ 99.5% |
-| Bill total match | 66.7% | ≥ 90% |
-
-Most of the gap comes from known issues the redesign fixes: page numbers taken from the model instead of the file, and summary lines counted alongside their detail lines. The full target list is in [`docs/context/project-overview.md`](docs/context/project-overview.md).
 
 ## Tests
 
