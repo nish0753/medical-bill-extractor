@@ -12,3 +12,7 @@ venv/
 .vscode/
 *.log
 .gemini/
+
+# Evaluation artefacts quote real bill lines; keep them out of git (the answer key lives outside the repo)
+eval/outputs/
+eval/reports/

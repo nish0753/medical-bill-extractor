@@ -17,3 +17,5 @@ result_*.json
 training_samples/
 tests/
 .gemini/
+.venv/
+eval/

@@ -1,0 +1,7 @@
+# Development/test split of the answer key (lld.md §11.1, P7).
+# dev:  inspect every failure; tune prompts and rules against these.
+# test: score at milestone ends only. Look at the aggregate, never at individual failures.
+# Linked bills stay together: 9 with 10 (same 90-page bill), 5 with 6 (5's implant invoice is a line in 6).
+# A test bill that gets inspected and fixed for moves to dev and is replaced.
+dev: [2, 3, 5, 6, 7, 9, 10, 12, 13, 14]
+test: [1, 4, 8, 11, 15]
