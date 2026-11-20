@@ -11,12 +11,13 @@
 | Pipeline runner | Plain Python functions (LangGraph removed) | Runs the stages in order, including the repair loop |
 | PDF / images | pdf2image (poppler), Pillow, pypdf | Render pages; read the PDF text layer |
 | OCR | RapidOCR (PaddleOCR's models on ONNX Runtime, CPU only) | Free, local; words with positions. Chosen over full PaddleOCR (about 1 GB and slow on CPU) and Tesseract (weaker on messy scans and small digits) |
-| LLM | Gemini 2.5 Flash, Flash-Lite, Pro (free tier) via langchain-google-genai | Page classification, line extraction, repair |
+| LLM | Gemini 2.5 Flash, Flash-Lite, Pro via langchain-google-genai: **the live model** (owner's decision, 2026-11-20) | Page classification, line extraction, repair. Qwen3.6-35B-A3B on Modal is kept for offline model comparisons only (`eval/backends.py`) |
 | Queue and job state | SQLite | Job queue, job status, document metadata. One worker processing one job at a time, since files are uploaded one by one. The queue stays because long bills run for minutes under Gemini rate limits |
 | File storage | Local folders | Original files, page images, page text, stage outputs (cache), results |
 | Evaluation | Python + rapidfuzz | Answer-key scorer, with fuzzy matching of item names |
+| Observability | LangSmith (`langsmith` SDK) | Traces of every request and eval run (see Observability) |
 | Review page | FastAPI + Jinja2 templates + HTMX | Server-rendered pages in the same app; no separate front-end build |
-| Deployment | The developer's own machine (a learning project); Docker image available | Production hosting and auto-scaling are deferred |
+| Deployment | **Hugging Face Spaces** (Docker Space) for the public demo, so an interviewer can open it from a link; the developer's machine for development | Free, no card; sleeps after ~48h idle (about a minute to wake). Files don't persist across restarts, which is fine for a demo. Production auto-scaling stays deferred |
 
 ## System Boundaries
 
@@ -57,7 +58,7 @@ Each stage stores its output, so stages can be re-run individually without spend
 
 Bills and documents also get a confidence: the weakest line, capped by how much of the bill's arithmetic could be checked (reconciled 1.0, only sections checked 0.8, nothing checkable 0.7, mismatch 0.4). Details in `lld.md` §8.9.
 
-Thresholds are tuned against trusted precision and confidence calibration. Because stages 4 and 9 both use Gemini, their errors may be correlated. Grounding and arithmetic are the primary defence; agreement between readings is supporting evidence only.
+Thresholds are tuned against trusted precision and confidence calibration. Because stages 4 and 9 both use Gemini, their errors may be correlated (candidate fix: GPT-OSS-120B on Groq for stage 9, see `progress-tracker.md`). Grounding and arithmetic are the primary defence; agreement between readings is supporting evidence only.
 
 ### Rate limits and caching
 
@@ -92,13 +93,16 @@ RabbitMQ settings for this workload:
 - A dead-letter queue for jobs that keep failing.
 - Optionally one message per page for large bills, with the bill-level checks run once all of its pages are done.
 
-## Observability (planned, after M4)
+## Observability
 
-**Tool: LangSmith** (owner's decision, 2026-11-20). It is a hosted service, so there is nothing to run locally. It is used through the `langsmith` SDK (`@traceable` spans), which doesn't need LangChain.
-- All tracing goes through one small interface in `core/` (a `span(name, **attributes)` context manager). Only that module imports the LangSmith SDK; tracing is off unless `LANGSMITH_API_KEY` and `LANGSMITH_TRACING=true` are set.
+**Tool: LangSmith** (owner's decision, 2026-11-20). It is a hosted service, so there is nothing to run locally. **Built for the current pipeline on 2026-11-20** (moved forward from "after M4" at the owner's request); the new pipeline reuses the same module.
+- All tracing goes through `app/tracing.py`: `setup()`, a `span(name, inputs=..., **metadata)` context manager, and `flush()`. Only that module imports the LangSmith SDK; tracing is off unless `LANGSMITH_API_KEY` and `LANGSMITH_TRACING=true` are set. Traces are addressed to the LangSmith **agent `medical-bill-extractor`**, environment from `LANGSMITH_AGENT_ENVIRONMENT` (`local` on the developer's machine; use `production` on the Hugging Face Space). The code never names a project, and `LANGSMITH_PROJECT` must not be set beside the agent variables: the SDK then leaves runs untraced. This needs `langsmith>=0.14.9` and `langchain-core>=1.6.11`; older LangChain tracers add a default project, which LangSmith rejects for agent-addressed runs.
+- `setup()` installs one global client whose `hide_inputs`/`hide_outputs` run `scrub()`. LangChain and LangGraph trace themselves automatically and use the same client, so their runs (the Gemini call, the graph nodes) are masked too.
+- Plain-Python steps use `tracing.traceable(name, inputs=..., outputs=...)` (the langsmith-trace skill's `@traceable` pattern), with summarisers so only sizes and counts are sent: `download_document`, `render_pdf_pages`, `preprocess_image`, `ocr_page` (character and line counts, never the text).
+- Today's trace tree (verified in LangSmith 2026-11-20): `POST /extract-…` → `extract_bill` → LangGraph → `prepare_pages` (`render_pdf_pages` or `preprocess_image`, `ocr_page` per page) → `build_batches` → `extract_batches` → `gemini_call` (model, attempts, quota errors, items) → `ChatGoogleGenerativeAI` (tokens, latency) → `validate_aggregate`.
 - Trace shape: one trace per job; a span per pipeline stage; a child span per model call with model, prompt version, tokens, latency, cost and cache hit; check results, confidence and status as span metadata. Evaluation runs are sent as LangSmith datasets/experiments, with the scorer's metrics as feedback scores.
-- **Tracing fails open:** if LangSmith is unreachable or slow, jobs still run normally. Spans are sent in the background; when they can't be sent, they're written to a local JSONL file under the data folder instead of blocking or failing the job.
-- **Privacy:** traces go to LangSmith's servers, a third party. By default, page images, OCR text and patient details are kept out of traces (masked inputs/outputs); item names and amounts are included only if the owner turns that on. Retention follows the LangSmith plan.
+- **Tracing fails open:** if LangSmith is unreachable or misconfigured, requests run exactly as without it (tested against a closed port). Spans are sent in a background thread. A local JSONL fallback for unsent spans is still planned for the new pipeline's data folder.
+- **Privacy:** traces go to LangSmith's servers, a third party. Owner's decision (2026-11-20): **extracted rows, no page images.** Traces keep the prompt, extracted rows (item names, amounts), timings, tokens, model, retries and errors. `scrub()` removes page images (base64 data URLs), all raw bytes, and the raw OCR text (dropped by key, and cut from the prompt at the OCR marker). The API traces only the URL's host and the upload's file extension, never the file name or full URL. Tests run with tracing forced off (`tests/conftest.py`). Retention follows the LangSmith plan.
 - **Limits:** the free LangSmith plan caps traces per month; check the current quota before enabling tracing on large runs, and sample evaluation runs if needed.
 
 ## Auth and Access Model

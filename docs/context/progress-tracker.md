@@ -8,7 +8,7 @@ Update this file after every meaningful implementation change.
 
 ## Current Goal
 
-- Owner decisions before M1/M2: main model (recommended: Qwen on Modal, Gemini for comparison) and the Gemini free-tier quota (see Open Questions).
+- Owner decision before the public demo and M2: the Gemini free-tier quota (see Open Questions).
 
 ## Completed
 
@@ -24,6 +24,8 @@ Update this file after every meaningful implementation change.
 
 ## In Progress
 
+- LangSmith skills installed (2026-11-20) from langchain-ai/langsmith-skills into `../.claude/skills/` (7 skills; the LangSmith CLI installer was not run). Tracing now follows the langsmith-trace skill: `@traceable` on the plain-Python steps, traces addressed to agent `medical-bill-extractor` / `local`. LangChain upgraded to 1.x (`langchain-core` 1.7.7, `langgraph` 1.2) because LangSmith rejected agent-addressed runs from the 0.3 tracer; offline suite and one real Gemini call pass on the new versions.
+- LangSmith tracing on the current pipeline (2026-11-20): `app/tracing.py` (setup, `span()`, `scrub()`, flush), spans on both API endpoints, `extract_bill` and `gemini_call`, LangChain/LangGraph auto-traces masked by the same client; eval runs flush traces; `tests/test_tracing.py` checks what would actually be sent. Smoke trace reached the owner's LangSmith.
 - M0 complete (2026-11-20): baseline recorded (`eval/baselines/latest.json`, old pipeline + Gemini 2.5 Flash) and targets written into `project-overview.md` (Quality and Evaluation). Work committed on branch `m0-eval`.
 - Model comparison on the old pipeline (2026-11-20), same prompt, images, OCR and batches; scored with pages ignored because the old pipeline copies the model's per-batch page numbers (fixed by invariant 5):
 
@@ -56,14 +58,16 @@ Milestones:
 
 ## Open Questions
 
-- Production deployment and auto-scaling: deferred while this runs on the owner's machine as a learning project. Revisit after M6. The current `render.yaml` won't suit the SQLite + local files setup (Render's free plan has no persistent disk). The planned scaling path is in `architecture.md`, Scaling Path.
+- Production auto-scaling: deferred. The public demo goes on Hugging Face Spaces (decided 2026-11-20); revisit real production hosting after M6. The current `render.yaml` won't suit the SQLite + local files setup (Render's free plan has no persistent disk). The planned scaling path is in `architecture.md`, Scaling Path.
 - Maximum file size and page count per job (today's limit is 20 MB).
+- **Public demo quota.** Gemini is the live model and the demo will be shown to interviewers, but the free tier allows 20 requests per model per day (about 4 ten-page bills). Options: enable paid Gemini with a budget alert (recommended; roughly ₹1–3 per 10-page bill), or stay free and show a clear "daily demo limit" message.
+- GPT-OSS-120B on Groq (owner asked, 2026-11-20): text-only, so it can't replace Gemini for reading page images. Free plan: 30 requests/min, 1,000/day, 8K tokens/min, 200K tokens/day (Groq docs table). Candidate for stage 9 (second reading works on OCR text only), where a different model family also removes the correlated-errors concern. Decide in M3.
 - Can the Gemini free tier process a 90-page bill in acceptable time? **Measured 2026-11-20: no, as designed.** The free tier allows only 20 requests per day per model (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`, gemini-2.5-flash and gemini-flash-latest). One page per call means one 90-page bill alone needs ~90+ calls. Needs an owner decision before M2: batch several pages per call, spread calls across the free models (each has its own daily quota), accept multi-day processing, or revisit the no-paid-model rule. The old pipeline's fallbacks gemini-2.0-flash and gemini-2.5-flash-lite return 404 for this key.
 - Privacy: revisit the decision to send full pages to the free tier before any real production use.
 - Result retention period.
 - Access control for the review page (at minimum a shared secret) before any public deployment.
 - Create `ui-context.md` for the review page before M5.
-- Observability: confirm what bill data may go into LangSmith traces (default: masked), and the free plan's monthly trace quota, before enabling it after M4.
+- LangSmith free plan's monthly trace quota: check before tracing large eval runs (a 15-bill run is ~100 runs including the auto-traced nodes and model calls).
 - Module layout of `app/` for the new pipeline: decide in M1.
 - RapidOCR, to be verified in M1 on the 50 sample pages:
   - seconds per page on the M2;
@@ -75,7 +79,10 @@ Milestones:
 
 - **Every printed line is returned, each with a role** (`billable` / `summary` / `breakdown`). Why: the owner wants all lines, not just totals, and the samples show summary/detail and parent/breakdown duplication that would otherwise double-count.
 - **An extended schema with `core` and `full` views.** Why: the owner was concerned about data size. Measured at about 250 bytes per line, so the full view is cheap, and `core` stays lean and close to the legacy schema.
-- **Free-tier Gemini only; free local OCR.** Why: the owner requires zero model cost.
+- **Free-tier Gemini only; free local OCR.** Why: the owner requires zero model cost. (Under review for the public demo: see the quota open question.)
+- **Gemini is the live model** (2026-11-20). Why: the owner's choice for the deployed demo. Qwen on Modal stays an offline comparison backend only.
+- **Public demo on Hugging Face Spaces** (2026-11-20). Why: free, no card, a permanent link an interviewer can open; runs the existing Dockerfile.
+- **LangSmith tracing now, rows but no page images** (2026-11-20). Why: the owner wants every trace in LangSmith; images and raw OCR text stay out to limit patient data in a third-party service.
 - **Full pages are sent to the free tier, privacy risk accepted.** Why: the owner's choice. Redaction was offered and declined.
 - **Async jobs, accuracy first.** Why: bills run to 90+ pages, and free-tier rate limits need queueing.
 - **A simple review page for flagged results.** Why: a human closes the loop, and corrections grow the answer key.

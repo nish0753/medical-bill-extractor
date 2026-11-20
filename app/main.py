@@ -4,10 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from starlette.requests import Request
 from .extractor import extract_bill_data
+from . import tracing
 from .schemas import FinalResponse
 import logging
 import requests
 import asyncio
+import os
 from urllib.parse import urlparse
 
 # Configure Logging
@@ -35,6 +37,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+def _flush_traces() -> None:
+    tracing.flush()
 
 
 def _base_response(is_success: bool, data: dict | None = None, error: str | None = None) -> dict:
@@ -135,16 +142,39 @@ def download_file_sync(url: str):
 
     return content, response.headers.get('Content-Type', '')
 
+@tracing.traceable("download_document", run_type="tool",
+                   inputs=lambda i: {"host": urlparse(i.get("url", "")).netloc},
+                   outputs=lambda out: {"bytes": len(out[0]), "content_type": out[1]})
+async def _download(url: str) -> tuple:
+    # Run the synchronous download in a thread so the event loop isn't blocked.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, download_file_sync, url)
+
+
 @app.post("/extract-bill-data", response_model=FinalResponse)
 async def extract_bill(request: BillRequest):
+    # Only the host is traced: a URL path or query can carry a patient name or a signed token.
+    with tracing.span("POST /extract-bill-data", inputs={"document_host": urlparse(request.document).netloc},
+                      endpoint="/extract-bill-data") as sp:
+        response = await _extract_bill(request)
+        _record(sp, response)
+        return response
+
+
+def _record(sp: "tracing.Span", response: dict) -> None:
+    sp.set(is_success=response["is_success"], item_count=response["data"]["total_item_count"],
+           error=response.get("error"))
+    sp.output({"is_success": response["is_success"], "total_item_count": response["data"]["total_item_count"],
+               "error": response.get("error")})
+
+
+async def _extract_bill(request: BillRequest) -> dict:
     try:
         # Step 1: Download the document
         logger.info("Download starting...")
         logger.info("Received request for document: %s", request.document)
         
-        # Run synchronous download in a separate thread to avoid blocking the event loop
-        loop = asyncio.get_running_loop()
-        pdf_bytes, content_type = await loop.run_in_executor(None, download_file_sync, request.document)
+        pdf_bytes, content_type = await _download(request.document)
         
         logger.info("Download complete. Size: %d bytes. Type: %s", len(pdf_bytes), content_type)
 
@@ -172,6 +202,16 @@ async def extract_bill(request: BillRequest):
 
 @app.post("/extract-from-file", response_model=FinalResponse)
 async def extract_from_file(file: UploadFile = File(...)):
+    # The file name is not traced (it often contains the patient's name); only its extension.
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    with tracing.span("POST /extract-from-file", inputs={"file_ext": ext, "content_type": file.content_type},
+                      endpoint="/extract-from-file") as sp:
+        response = await _extract_from_file(file)
+        _record(sp, response)
+        return response
+
+
+async def _extract_from_file(file: UploadFile) -> dict:
     try:
         logger.info("Received file upload: %s", file.filename)
         contents = await file.read()

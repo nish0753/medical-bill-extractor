@@ -115,7 +115,12 @@ def main(argv: list[str] | None = None) -> int:
             headers={"Modal-Key": key.strip(), "Modal-Secret": secret.strip()},
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
-    asyncio.run(run_all(files, args.out, args.force, args.pause, args.budget_usd, args.gpu_rate))
+    try:
+        asyncio.run(run_all(files, args.out, args.force, args.pause, args.budget_usd, args.gpu_rate))
+    finally:
+        from app import tracing
+
+        tracing.flush()  # eval runs are traced too when LANGSMITH_TRACING=true
     return 0
 
 

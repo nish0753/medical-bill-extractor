@@ -1,172 +1,79 @@
-# Automated Bill Extraction System
+# Medical Bill Extractor
 
-Production-ready FastAPI service that extracts structured line items from bill images and PDFs using a hybrid OCR + LLM pipeline.
+A FastAPI service that reads hospital bills and invoices (PDFs or images) and returns every line item as structured JSON: item name, quantity, rate and amount, page by page.
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-green)
-![LangChain](https://img.shields.io/badge/LangChain-Enabled-2a7f62)
-![Gemini](https://img.shields.io/badge/Google-Gemini%202.5%20Flash-orange)
-![Docker](https://img.shields.io/badge/Deployment-Docker-blue)
+Built originally for the Bajaj Finserv Datathon (ranked 44th), now being redesigned around one principle: **the model reads, deterministic code checks.** Gemini turns page images into rows; code verifies every value against the page text and the bill's own arithmetic, and flags anything it can't confirm.
 
-## Purpose
+![Python](https://img.shields.io/badge/Python-3.10-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green)
+![Gemini](https://img.shields.io/badge/Gemini-2.5%20Flash-orange)
+![LangSmith](https://img.shields.io/badge/Tracing-LangSmith-2a7f62)
 
-Medical bills and invoices are semi-structured and vary across providers. This service accepts a bill document URL or uploaded file, extracts itemized lines, and returns normalized JSON in a fixed response schema.
-
-## End-to-End Execution Flow
+## How it works
 
 ```mermaid
-flowchart TD
-    A[Client Request] --> B{Endpoint}
-    B -->|POST /extract-bill-data| C[Download file from URL]
-    B -->|POST /extract-from-file| D[Read uploaded bytes]
-    C --> E[Normalize MIME type]
-    D --> E
-    E --> F{PDF or Image?}
-    F -->|PDF| G[Convert pages with pdf2image]
-    F -->|Image| H[Preprocess with Pillow]
-    G --> I[OCR with Tesseract optional]
-    H --> I
-    I --> J[Build page batches]
-    J --> K[LangGraph workflow orchestration]
-    K --> L[LangChain + Gemini structured extraction]
-    L --> M{Quota or model issue?}
-    M -->|Yes| N[Retry + fallback models]
-    M -->|No| O[Aggregate page results]
-    N --> O
-    O --> P[Normalize schema + safe numeric casting]
-    P --> Q[Final JSON response]
+flowchart LR
+    A[PDF or image] --> B[Render pages]
+    B --> C[OCR text<br/>Tesseract]
+    B --> D[Gemini 2.5 Flash<br/>structured output]
+    C --> D
+    D --> E[Merge and normalise]
+    E --> F[JSON response]
 ```
 
-## Internal Extraction Workflow (Detailed)
+1. PDFs are rendered to page images (pdf2image); single images are cleaned up with Pillow.
+2. Tesseract OCR text is sent alongside each page image as extra context.
+3. Gemini extracts the rows through LangChain structured output, inside a small LangGraph pipeline, with retries and model fallbacks on quota errors.
+4. The API normalises the result into a fixed response schema.
 
-```mermaid
-flowchart TD
-    A[extract_bill_data receives bytes + mime_type] --> B[Normalize content type]
-    B --> C{Magic bytes indicate PDF?}
-    C -->|Yes| D[Force mime_type to application/pdf]
-    C -->|No| E[Keep original mime_type]
-    D --> F
-    E --> F
-    F[LangGraph start: prepare_pages node] --> G{Document type}
+Every request is traced in LangSmith (see [Observability](#observability)).
 
-    G -->|PDF| H[convert_from_bytes at configured DPI]
-    H --> I[For each page: optional OCR + JPEG payload]
+## Quick start
 
-    G -->|Image| J[preprocess_image via Pillow]
-    J --> K[optional OCR + single JPEG payload]
-
-    I --> L[build_batches node]
-    K --> L
-    L --> M[Chunk pages by BATCH_SIZE]
-    M --> N[extract_batches node]
-
-    N --> O[call_gemini_api_async]
-    O --> P{USE_MOCK_MODE true?}
-    P -->|Yes| Q[Return mock extraction]
-    P -->|No| R[Build multimodal prompt]
-
-    R --> S[Try primary model]
-    S --> T{Success?}
-    T -->|Yes| U[Return structured output]
-    T -->|No| V{Quota/429 or model limit?}
-    V -->|Retryable| W[Exponential backoff + retry]
-    W --> S
-    V -->|Model exhausted| X[Try fallback model]
-    X --> S
-
-    Q --> Y[validate_aggregate node]
-    U --> Y
-    Y --> Z[Merge pagewise_line_items + recompute total_item_count]
-    Z --> AA[Return normalized result to API layer]
-```
-
-## Technology Map (Where Each Tech Is Used)
-
-| Stage              | Technology                                    | Why it is used                                              |
-| ------------------ | --------------------------------------------- | ----------------------------------------------------------- |
-| API layer          | FastAPI, Pydantic                             | Request validation, response schema, async endpoints        |
-| Networking         | requests                                      | Download remote documents from URL input                    |
-| File understanding | MIME normalization + PDF magic-byte detection | Reliable type detection even for incorrect headers          |
-| PDF handling       | pdf2image                                     | Convert PDF pages to images for multimodal extraction       |
-| Image enhancement  | Pillow                                        | Improve image quality before OCR/model call                 |
-| OCR context        | pytesseract                                   | Extra textual signal for noisy or low-quality pages         |
-| Orchestration      | LangGraph                                     | Stepwise pipeline: prepare -> batch -> extract -> aggregate |
-| LLM integration    | LangChain + ChatGoogleGenerativeAI            | Structured extraction via Gemini with typed output          |
-| Model resilience   | Retry + fallback model list                   | Better behavior under rate limit/quota pressure             |
-| Packaging          | Docker, render.yaml                           | Deployable service for cloud runtime                        |
-| Quality            | pytest                                        | Unit and API behavior validation                            |
-
-## API Overview
-
-### 1) Health
-
-- Method: GET
-- Path: /health
-- Purpose: Liveness/version check
-
-Example:
+Requirements: Python 3.10, plus `poppler` and `tesseract` (`brew install poppler tesseract`, or `apt-get install poppler-utils tesseract-ocr`).
 
 ```bash
-curl http://127.0.0.1:8000/health
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env    # or create .env by hand, see Configuration
+uvicorn app.main:app --reload --port 8000
 ```
 
-### 2) Extract from URL
+Open http://127.0.0.1:8000/docs for the interactive API.
 
-- Method: POST
-- Path: /extract-bill-data
-- Input: JSON with document URL
-
-Request:
-
-```json
-{
-  "document": "https://example.com/bill.pdf"
-}
-```
-
-Example:
+With Docker:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/extract-bill-data \
-  -H "Content-Type: application/json" \
-  -d '{"document":"https://example.com/bill.pdf"}'
+docker build -t bill-extractor .
+docker run -p 10000:10000 --env-file .env bill-extractor
 ```
 
-### 3) Extract from File Upload
+## API
 
-- Method: POST
-- Path: /extract-from-file
-- Input: multipart/form-data with file
-
-Example:
+| Method | Path | Input |
+|---|---|---|
+| `POST` | `/extract-from-file` | multipart upload, field `file` (PDF, PNG or JPEG, up to 20 MB) |
+| `POST` | `/extract-bill-data` | JSON `{"document": "https://.../bill.pdf"}` |
+| `GET` | `/health` | — |
 
 ```bash
-curl -X POST http://127.0.0.1:8000/extract-from-file \
-  -F "file=@/absolute/path/to/bill.pdf"
+curl -X POST http://127.0.0.1:8000/extract-from-file -F "file=@bill.pdf"
 ```
 
-### Response Shape
+Response:
 
 ```json
 {
   "is_success": true,
-  "token_usage": {
-    "total_tokens": 0,
-    "input_tokens": 0,
-    "output_tokens": 0
-  },
+  "token_usage": {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0},
   "data": {
     "pagewise_line_items": [
       {
         "page_no": "1",
         "page_type": "Bill Detail",
         "bill_items": [
-          {
-            "item_name": "Sample",
-            "item_amount": 100.0,
-            "item_rate": 100.0,
-            "item_quantity": 1.0
-          }
+          {"item_name": "CBC", "item_amount": 240.0, "item_rate": 240.0, "item_quantity": 1.0}
         ]
       }
     ],
@@ -176,78 +83,80 @@ curl -X POST http://127.0.0.1:8000/extract-from-file \
 }
 ```
 
-## Setup and Run
+Extraction failures return HTTP 200 with `is_success: false` and an `error` message. The schema is fixed by the original Datathon contract.
 
-### 1) Install dependencies
+## Configuration
+
+Set in `.env` or the environment.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GOOGLE_API_KEY` | yes | — | Gemini API key |
+| `GEMINI_MODEL` | | `gemini-2.5-flash` | Main model |
+| `GEMINI_MODEL_FALLBACKS` | | `gemini-flash-latest,gemini-2.0-flash` | Tried in order on quota errors |
+| `BATCH_SIZE` | | `2` | Pages per model call |
+| `PDF_DPI` | | `200` | Page render resolution |
+| `MAX_RETRIES` | | `10` | Retries per model |
+| `USE_MOCK_MODE` | | `false` | Return sample data without calling Gemini |
+| `LANGSMITH_TRACING` | | — | `true` to send traces to LangSmith |
+| `LANGSMITH_API_KEY` | for tracing | — | LangSmith key |
+| `LANGSMITH_ENDPOINT` | | `https://api.smith.langchain.com` | LangSmith API |
+| `LANGSMITH_AGENT_ID` | for tracing | — | `medical-bill-extractor` |
+| `LANGSMITH_AGENT_ENVIRONMENT` | for tracing | — | `local`, `development`, `staging` or `production` |
+
+Don't set `LANGSMITH_PROJECT` together with the agent variables; LangSmith then records nothing.
+
+## Observability
+
+Each request produces one LangSmith trace: the API call, page rendering, OCR, every Gemini call (model, retries, tokens, latency) and the extracted rows.
+
+Bills contain patient data, so all tracing goes through [`app/tracing.py`](app/tracing.py), which removes page images, file bytes and raw OCR text before anything leaves the machine. File names and full document URLs are never traced. If LangSmith is unreachable, requests run normally.
+
+## Evaluation
+
+The `eval/` harness scores any output against a hand-checked answer key of 15 real hospital bills (1,069 lines), kept outside the repository because it contains patient data. Lines are matched by page, exact amount and fuzzy item name.
 
 ```bash
-pip install -r requirements.txt
+python -m eval.run_baseline --out eval/outputs/my-run          # run the pipeline on all samples
+python -m eval.run_eval --outputs eval/outputs/my-run --format legacy --label my-run --compare
 ```
 
-System dependencies required for PDF/OCR:
+Baseline of the current pipeline, dev split:
 
-- poppler-utils
-- tesseract-ocr
+| Metric | Current | Target |
+|---|---|---|
+| Line recall | 65.0% | ≥ 97% (printed bills) |
+| Line precision | 67.4% | ≥ 98% |
+| Amount exact match | 97.1% | ≥ 99.5% |
+| Bill total match | 66.7% | ≥ 90% |
 
-### 2) Configure environment
+Most of the gap comes from known issues the redesign fixes: page numbers taken from the model instead of the file, and summary lines counted alongside their detail lines. The full target list is in [`docs/context/project-overview.md`](docs/context/project-overview.md).
 
-Create .env in the project root:
-
-```env
-GOOGLE_API_KEY=your_google_api_key
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_MODEL_FALLBACKS=gemini-flash-latest,gemini-2.0-flash
-MAX_RETRIES=10
-BATCH_SIZE=2
-PDF_DPI=200
-USE_MOCK_MODE=false
-```
-
-### 3) Start the API
+## Tests
 
 ```bash
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+pytest -q -m "not integration"    # offline, no API calls
+pytest -q                          # also calls Gemini (needs a key and quota)
 ```
 
-Swagger UI:
-
-- http://127.0.0.1:8000/docs
-
-## Project Structure
+## Project layout
 
 ```text
-.
-|-- app/
-|   |-- main.py          # FastAPI routes, request/response normalization
-|   |-- extractor.py     # Hybrid extraction pipeline + LangGraph workflow
-|   `-- schemas.py       # Pydantic output models
-|-- tests/
-|   |-- test_api.py      # Endpoint and validation tests
-|   |-- test_unit.py     # Utility and workflow behavior tests
-|   `-- test_models.py   # Integration smoke tests for model access
-|-- Dockerfile
-|-- render.yaml
-|-- requirements.txt
-|-- pytest.ini
-`-- README.md
+app/
+  main.py          API routes and response normalisation
+  extractor.py     extraction pipeline (render, OCR, Gemini, merge)
+  tracing.py       LangSmith tracing and data masking
+  schemas.py       response models
+eval/              answer-key scorer, baseline runner, dataset converters
+tests/             API, pipeline, tracing and scorer tests
+docs/context/      design docs: overview, architecture, low-level design, progress
 ```
 
-## Testing
+## Roadmap
 
-```bash
-# Fast local signal (no external model dependency)
-pytest -q -m "not integration"
+The redesign is specified in [`docs/context/`](docs/context/) and tracked in [`progress-tracker.md`](docs/context/progress-tracker.md):
 
-# Full suite
-pytest -q
-```
-
-## Deployment Notes
-
-- The service is containerized via Dockerfile.
-- render.yaml is included for Render deployment.
-- If model quota is exhausted, extraction can fail unless USE_MOCK_MODE is set to true for demo/testing.
-
-## Achievement
-
-Rank 44 in Bajaj Finserv Datathon.
+- every printed line returned with a role (billable, summary or breakdown), so totals never double-count;
+- per-line source locations and confidence, checked against OCR text and the bill's own totals;
+- async jobs for long bills, and a review page for flagged documents;
+- a public demo on Hugging Face Spaces.

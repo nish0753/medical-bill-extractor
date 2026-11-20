@@ -15,7 +15,7 @@ Follow `docs/context/ai-workflow-rules.md`, and update `progress-tracker.md` aft
 
 ## What this is
 
-A FastAPI service that extracts itemized line items from bill/invoice images and PDFs. It converts each document into page images, adds optional Tesseract OCR text, and sends both to Gemini (via LangChain structured output) inside a LangGraph pipeline. The JSON response schema is fixed by the hackathon this was built for (Bajaj Finserv Datathon), so don't change field names or nesting in `app/schemas.py`.
+A FastAPI service that extracts itemized line items from bill/invoice images and PDFs. It converts each document into page images, adds optional Tesseract OCR text, and sends both to Gemini (via LangChain 1.x structured output) inside a LangGraph pipeline. The JSON response schema is fixed by the hackathon this was built for (Bajaj Finserv Datathon), so don't change field names or nesting in `app/schemas.py`.
 
 ## Commands
 
@@ -46,6 +46,7 @@ Set these as env vars or in a `.env` file in the project root. `load_dotenv(over
 - `GOOGLE_API_KEY` (required, even when `USE_MOCK_MODE=true`: `extract_bill_data` checks it before doing anything else)
 - `GEMINI_MODEL` (default `gemini-2.5-flash`), `GEMINI_MODEL_FALLBACKS` (comma-separated)
 - `MAX_RETRIES`, `BATCH_SIZE` (pages per Gemini call), `PDF_DPI`, `USE_MOCK_MODE`
+- LangSmith tracing: `LANGSMITH_TRACING=true` plus `LANGSMITH_API_KEY` turn it on; `LANGSMITH_ENDPOINT` and `LANGSMITH_AGENT_ID=medical-bill-extractor` / `LANGSMITH_AGENT_ENVIRONMENT` (`local`, `development`, `staging` or `production`) say where traces go. Don't also set `LANGSMITH_PROJECT`: with both, the SDK traces nothing; `APP_ENV` is added as trace metadata. All tracing goes through `app/tracing.py`, which masks page images, bytes and raw OCR text before anything is sent; see `architecture.md`, Observability. Tests force tracing off (`tests/conftest.py`).
 
 All of these except `GOOGLE_API_KEY` are read **once at import time** into module globals in `app/extractor.py`. To change them in a test, use `monkeypatch.setattr(extractor, "BATCH_SIZE", ...)`. Setting the env var after import has no effect.
 

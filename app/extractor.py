@@ -6,7 +6,9 @@ import shutil
 import logging
 import asyncio
 import base64
+import time
 from typing import Any, TypedDict
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
@@ -16,12 +18,15 @@ from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
+from . import tracing
+
 try:
     import pytesseract as _pytesseract
 except ImportError:
     _pytesseract = None
 
 load_dotenv(override=True)
+tracing.setup()
 
 # --- Logging ---
 logger = logging.getLogger(__name__)
@@ -113,6 +118,17 @@ async def _get_mock_response() -> dict[str, Any]:
     }
 
 
+def _image_summary(inputs: dict) -> dict:
+    image = inputs.get("image")
+    return {"image_size": list(getattr(image, "size", ())), "mode": getattr(image, "mode", None)}
+
+
+def _text_summary(text: Any) -> dict:
+    # The OCR text itself is never traced (patient details); only how much was read.
+    return {"chars": len(text or ""), "lines": len((text or "").splitlines())}
+
+
+@tracing.traceable("ocr_page", run_type="tool", inputs=_image_summary, outputs=_text_summary)
 async def _extract_ocr_text(image: Image.Image) -> str:
     if not pytesseract:
         return ""
@@ -125,14 +141,38 @@ async def _extract_ocr_text(image: Image.Image) -> str:
         return ""
 
 
+@tracing.traceable("render_pdf_pages", run_type="tool",
+                   inputs=lambda i: {"pdf_bytes": len(i.get("file_data") or b""), "dpi": PDF_DPI},
+                   outputs=lambda images: {"page_count": len(images),
+                                           "page_sizes": [list(im.size) for im in images[:5]]})
+async def _render_pdf(file_data: bytes) -> list:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=PDF_DPI))
+
+
+@tracing.traceable("preprocess_image", run_type="tool",
+                   inputs=lambda i: {"image_bytes": len(i.get("file_data") or b"")},
+                   outputs=lambda out: {"jpeg_bytes": len(out or b"")})
+async def _preprocess(file_data: bytes) -> bytes:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, preprocess_image, file_data)
+
+
+@tracing.traceable("download_document", run_type="tool",
+                   inputs=lambda i: {"host": urlparse(i.get("url", "")).netloc},
+                   outputs=lambda out: {"bytes": len(out[0]), "content_type": out[1]})
+async def _download(url: str) -> tuple:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, download_image, url)
+
+
 async def _prepare_pages_node(state: BillExtractionState) -> dict[str, Any]:
     file_data = state["file_data"]
     mime_type = state["mime_type"]
 
     if mime_type == "application/pdf":
         logger.info("PDF detected. Converting to images for batch processing.")
-        loop = asyncio.get_running_loop()
-        images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=PDF_DPI))
+        images = await _render_pdf(file_data)
         logger.info("PDF converted. Total pages: %d", len(images))
 
         pages = []
@@ -158,8 +198,7 @@ async def _prepare_pages_node(state: BillExtractionState) -> dict[str, Any]:
 
     if mime_type.startswith("image/"):
         logger.info("Applying image preprocessing...")
-        loop = asyncio.get_running_loop()
-        processed_data = await loop.run_in_executor(None, preprocess_image, file_data)
+        processed_data = await _preprocess(file_data)
 
         page_ocr_context = ""
         if pytesseract:
@@ -317,8 +356,7 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
 
     # 1. Get Raw Data
     if isinstance(image_source, str):
-        loop = asyncio.get_running_loop()
-        file_data, mime_type = await loop.run_in_executor(None, download_image, image_source)
+        file_data, mime_type = await _download(image_source)
     else:
         file_data = image_source
         if not mime_type:
@@ -333,9 +371,18 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             logger.debug("Detected PDF magic bytes. Overriding mime_type '%s' to 'application/pdf'", mime_type)
             mime_type = 'application/pdf'
 
-    workflow = _get_workflow()
-    final_state = await workflow.ainvoke({"file_data": file_data, "mime_type": mime_type})
-    return final_state.get("result", {"pagewise_line_items": [], "total_item_count": 0})
+    with tracing.span("extract_bill", inputs={"mime_type": mime_type, "size_bytes": len(file_data or b"")},
+                      mime_type=mime_type, size_bytes=len(file_data or b""), batch_size=BATCH_SIZE,
+                      ocr_available=pytesseract is not None) as sp:
+        started = time.monotonic()
+        workflow = _get_workflow()
+        final_state = await workflow.ainvoke({"file_data": file_data, "mime_type": mime_type})
+        result = final_state.get("result", {"pagewise_line_items": [], "total_item_count": 0})
+        sp.set(page_count=len(final_state.get("pages", [])), batch_count=len(final_state.get("batches", [])),
+               item_count=result.get("total_item_count", 0), seconds=round(time.monotonic() - started, 2))
+        sp.output({"pages_returned": len(result.get("pagewise_line_items", [])),
+                   "total_item_count": result.get("total_item_count", 0)})
+        return result
 
 
 async def call_gemini_api_async(media_payloads: list[tuple[str, bytes]], ocr_context: str = "") -> dict[str, Any]:
@@ -396,10 +443,19 @@ async def call_gemini_api_async(media_payloads: list[tuple[str, bytes]], ocr_con
 
     content.append({"type": "text", "text": prompt})
 
+    with tracing.span("gemini_call", run_type="chain", inputs={"pages": len(media_payloads)},
+                      pages=len(media_payloads), has_ocr=bool(ocr_context)) as sp:
+        return await _call_with_fallbacks(content, model_errors, sp)
+
+
+async def _call_with_fallbacks(content: list, model_errors: list[str], sp: "tracing.Span") -> dict[str, Any]:
     max_retries = MAX_RETRIES
+    attempts = 0
+    quota_errors = 0
     for model_name in _candidate_models():
         llm = _get_llm(model_name)
         for attempt in range(max_retries):
+            attempts += 1
             try:
                 response = await llm.ainvoke([HumanMessage(content=content)])
                 data_dict = response.model_dump()
@@ -409,12 +465,14 @@ async def call_gemini_api_async(media_payloads: list[tuple[str, bytes]], ocr_con
                     for page in data_dict.get("pagewise_line_items", [])
                 )
                 data_dict["total_item_count"] = total_count
+                sp.set(model=model_name, attempts=attempts, quota_errors=quota_errors, item_count=total_count)
                 return data_dict
 
             except Exception as e:
                 error_str = str(e)
                 is_quota_error = "429" in error_str or "Quota exceeded" in error_str or "ResourceExhausted" in error_str
                 is_model_zero_quota = is_quota_error and f"model: {model_name}" in error_str and "limit: 0" in error_str
+                quota_errors += int(is_quota_error)
 
                 if is_model_zero_quota:
                     logger.warning("Model %s quota is currently zero. Trying next fallback model.", model_name)
@@ -441,4 +499,5 @@ async def call_gemini_api_async(media_payloads: list[tuple[str, bytes]], ocr_con
                 model_errors.append(f"{model_name}: {error_str}")
 
     joined_errors = " | ".join(model_errors) if model_errors else "No model candidates succeeded"
+    sp.set(attempts=attempts, quota_errors=quota_errors, failed_models=_candidate_models())
     raise ValueError(f"Gemini API failed across candidate models after retries: {joined_errors}")
