@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# tracing.setup() already ran when the extractor was imported, before logging was configured
+logger.info("LangSmith tracing %s", tracing.status())
 
 # --- Configuration ---
 MAX_UPLOAD_SIZE_MB = 20

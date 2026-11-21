@@ -28,6 +28,7 @@ DROP_KEYS = {"ocr_context", "file_data", "media_payload", "media_payloads"}
 _MAX_DEPTH = 40
 
 _enabled = False
+_status = "off: setup() not called"  # why tracing is on or off, for the startup log
 
 
 def _truthy(value: str | None) -> bool:
@@ -36,6 +37,12 @@ def _truthy(value: str | None) -> bool:
 
 def is_enabled() -> bool:
     return _enabled
+
+
+def status() -> str:
+    """One line saying whether tracing is on and, if not, why. Logged by the API at startup, because
+    setup() runs at import time, before logging is configured, so its own log lines are lost."""
+    return _status
 
 
 def include_images() -> bool:
@@ -112,8 +119,10 @@ def setup(client: Any = None) -> bool:
 
     `client` is for tests: a langsmith.Client built with `hide_inputs=masked, hide_outputs=masked`.
     """
-    global _enabled
-    want = _truthy(os.getenv("LANGSMITH_TRACING")) and bool(os.getenv("LANGSMITH_API_KEY", "").strip())
+    global _enabled, _status
+    tracing_flag = _truthy(os.getenv("LANGSMITH_TRACING"))
+    has_key = bool(os.getenv("LANGSMITH_API_KEY", "").strip())
+    want = tracing_flag and has_key
     try:
         import langsmith as ls
 
@@ -121,6 +130,8 @@ def setup(client: Any = None) -> bool:
             # Also stops LangChain's own auto-tracing if LANGSMITH_TRACING is set without a key.
             ls.configure(enabled=False)
             _enabled = False
+            _status = ("off: LANGSMITH_TRACING=true but LANGSMITH_API_KEY is empty" if tracing_flag
+                       else "off: LANGSMITH_TRACING is not true")
             return False
         # Where traces go is left to the SDK's own env vars: LANGSMITH_AGENT_ID/_ENVIRONMENT (an agent
         # address) or LANGSMITH_PROJECT. Passing a project here would silently override an agent address.
@@ -130,10 +141,14 @@ def setup(client: Any = None) -> bool:
             metadata={"app_env": os.getenv("APP_ENV", "local")},
         )
         _enabled = True
-        logger.info("LangSmith tracing on")
+        where = os.getenv("LANGSMITH_AGENT_ID") and (
+            f"agent {os.getenv('LANGSMITH_AGENT_ID')} / {os.getenv('LANGSMITH_AGENT_ENVIRONMENT', '?')}")
+        _status = f"on ({where or 'project ' + os.getenv('LANGSMITH_PROJECT', 'default')})"
+        logger.info("LangSmith tracing %s", _status)
     except Exception:
         logger.exception("LangSmith setup failed; tracing off")
         _enabled = False
+        _status = "off: LangSmith setup failed (see the error above)"
     return _enabled
 
 

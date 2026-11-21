@@ -76,6 +76,13 @@ class TestSpanWhenOff:
         monkeypatch.setenv("LANGSMITH_TRACING", "true")
         monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
         assert tracing.setup() is False
+        assert tracing.status() == "off: LANGSMITH_TRACING=true but LANGSMITH_API_KEY is empty"
+
+    def test_status_says_why_when_flag_off(self, monkeypatch):
+        monkeypatch.setenv("LANGSMITH_TRACING", "false")
+        monkeypatch.setenv("LANGSMITH_API_KEY", "test-key")
+        assert tracing.setup() is False
+        assert tracing.status() == "off: LANGSMITH_TRACING is not true"
 
     def test_noop_span_runs_block_and_propagates_errors(self):
         tracing._enabled = False

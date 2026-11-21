@@ -6,3 +6,17 @@ services:
     envVars:
       - key: GOOGLE_API_KEY
         sync: false
+      # LangSmith tracing (optional). Secrets use sync: false, so Render asks for them.
+      # Never also set LANGSMITH_PROJECT: with the agent variables the SDK then traces nothing.
+      - key: LANGSMITH_TRACING
+        value: "true"
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: LANGSMITH_ENDPOINT
+        value: https://api.smith.langchain.com
+      - key: LANGSMITH_AGENT_ID
+        value: medical-bill-extractor
+      - key: LANGSMITH_AGENT_ENVIRONMENT
+        value: production
+      - key: LANGSMITH_INCLUDE_IMAGES
+        value: "false"  # public service: keep page images out of traces
