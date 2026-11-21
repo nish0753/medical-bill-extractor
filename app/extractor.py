@@ -6,6 +6,7 @@ import shutil
 import logging
 import asyncio
 import base64
+import re
 import time
 from typing import Any, TypedDict
 from urllib.parse import urlparse
@@ -232,9 +233,34 @@ async def _build_batches_node(state: BillExtractionState) -> dict[str, Any]:
         page_slice = pages[i : i + BATCH_SIZE]
         media_payloads = [page["media_payload"] for page in page_slice]
         ocr_context = "".join(page["ocr_context"] for page in page_slice if page.get("ocr_context"))
-        batches.append({"media_payloads": media_payloads, "ocr_context": ocr_context})
+        page_nos = [int(page["page_no"]) for page in page_slice]
+        batches.append({"media_payloads": media_payloads, "ocr_context": ocr_context, "page_nos": page_nos})
 
     return {"batches": batches}
+
+
+def _resolve_page_no(model_page_no: Any, batch_page_nos: list[int], position: int) -> int:
+    """Map the model's page number for one batch onto the physical page in the file.
+
+    The model only sees its own batch, so it usually numbers pages from 1 (relative).
+    It may also echo the physical number from the OCR headers (absolute). Both are
+    accepted; anything else falls back to the entry's position within the batch.
+    The two readings never conflict: relative 1..k overlaps absolute numbers only in
+    the first batch, where they are identical.
+    """
+    count = len(batch_page_nos)
+    if count == 1:
+        return batch_page_nos[0]
+
+    match = re.search(r"\d+", str(model_page_no or ""))
+    if match:
+        n = int(match.group())
+        if n in batch_page_nos:
+            return n
+        if 1 <= n <= count:
+            return batch_page_nos[n - 1]
+
+    return batch_page_nos[min(position, count - 1)]
 
 
 async def _extract_batches_node(state: BillExtractionState) -> dict[str, Any]:
@@ -253,11 +279,33 @@ async def _extract_batches_node(state: BillExtractionState) -> dict[str, Any]:
 
 
 async def _validate_and_aggregate_node(state: BillExtractionState) -> dict[str, Any]:
-    aggregated_pages: list[dict[str, Any]] = []
-    for batch_result in state.get("batch_results", []):
-        pages = batch_result.get("pagewise_line_items", [])
-        if isinstance(pages, list):
-            aggregated_pages.extend(page for page in pages if isinstance(page, dict))
+    batches = state.get("batches", [])
+    pages_by_no: dict[int, dict[str, Any]] = {}
+
+    for batch_idx, batch_result in enumerate(state.get("batch_results", [])):
+        pages = batch_result.get("pagewise_line_items", []) if isinstance(batch_result, dict) else []
+        if not isinstance(pages, list):
+            continue
+        batch_page_nos = batches[batch_idx].get("page_nos") if batch_idx < len(batches) else None
+        if not batch_page_nos:
+            batch_page_nos = [1]
+
+        batch_pages = [p for p in pages if isinstance(p, dict)]
+        resolved = [_resolve_page_no(p.get("page_no"), batch_page_nos, i) for i, p in enumerate(batch_pages)]
+        if len(batch_pages) == len(batch_page_nos) and len(set(resolved)) < len(resolved):
+            # One entry per page but clashing labels (e.g. all "1"): trust the order instead.
+            resolved = list(batch_page_nos)
+
+        for page, physical_no in zip(batch_pages, resolved):
+            items = page.get("bill_items", [])
+            items = items if isinstance(items, list) else []
+            if physical_no in pages_by_no:
+                # The model split one page into several entries: merge them.
+                pages_by_no[physical_no]["bill_items"].extend(items)
+            else:
+                pages_by_no[physical_no] = {**page, "page_no": str(physical_no), "bill_items": list(items)}
+
+    aggregated_pages = [pages_by_no[no] for no in sorted(pages_by_no)]
 
     total_item_count = sum(
         len(page.get("bill_items", []))

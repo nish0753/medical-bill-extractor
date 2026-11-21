@@ -11,7 +11,7 @@
 | Pipeline runner | Plain Python functions (LangGraph removed) | Runs the stages in order, including the repair loop |
 | PDF / images | pdf2image (poppler), Pillow, pypdf | Render pages; read the PDF text layer |
 | OCR | RapidOCR (PaddleOCR's models on ONNX Runtime, CPU only) | Free, local; words with positions. Chosen over full PaddleOCR (about 1 GB and slow on CPU) and Tesseract (weaker on messy scans and small digits) |
-| LLM | Gemini 2.5 Flash, Flash-Lite, Pro via langchain-google-genai: **the live model** (owner's decision, 2026-11-20) | Page classification, line extraction, repair. Qwen3.6-35B-A3B on Modal is kept for offline model comparisons only (`eval/backends.py`) |
+| LLM | Gemini 2.5 Flash, Flash-Lite, Pro via langchain-google-genai: **the live model** (owner's decision, 2026-11-20) | Page classification, line extraction, repair. Qwen3.6-35B-A3B on Modal is kept for offline model comparisons only (`eval/backends.py`), served from our own deploy script (see Self-hosted Comparison Endpoint) |
 | Queue and job state | SQLite | Job queue, job status, document metadata. One worker processing one job at a time, since files are uploaded one by one. The queue stays because long bills run for minutes under Gemini rate limits |
 | File storage | Local folders | Original files, page images, page text, stage outputs (cache), results |
 | Evaluation | Python + rapidfuzz | Answer-key scorer, with fuzzy matching of item names |
@@ -24,6 +24,7 @@
 - `app/`: the service. Today it has `main.py` (routes and response normalisation), `extractor.py` (the old pipeline) and `schemas.py` (response models). The module layout for the new pipeline is decided in M1.
 - `tests/`: pytest suite. Offline by default; tests that call the network are marked `integration`.
 - `docs/context/`: these context files, the source of truth for scope and design.
+- `serving/`: deploy scripts for self-hosted comparison models on Modal. Never imported by `app/`; not part of the Docker image.
 - `../TRAINING_SAMPLES/` and `../TRAINING_SAMPLES_extracted/`: input bills and the answer key, kept outside the repo. Read-only except through an approved migration or the review page.
 
 ### Pipeline stages
@@ -102,8 +103,31 @@ RabbitMQ settings for this workload:
 - Today's trace tree (verified in LangSmith 2026-11-20): `POST /extract-…` → `extract_bill` → LangGraph → `prepare_pages` (`render_pdf_pages` or `preprocess_image`, `ocr_page` per page) → `build_batches` → `extract_batches` → `gemini_call` (model, attempts, quota errors, items) → `ChatGoogleGenerativeAI` (tokens, latency) → `validate_aggregate`.
 - Trace shape: one trace per job; a span per pipeline stage; a child span per model call with model, prompt version, tokens, latency, cost and cache hit; check results, confidence and status as span metadata. Evaluation runs are sent as LangSmith datasets/experiments, with the scorer's metrics as feedback scores.
 - **Tracing fails open:** if LangSmith is unreachable or misconfigured, requests run exactly as without it (tested against a closed port). Spans are sent in a background thread. A local JSONL fallback for unsent spans is still planned for the new pipeline's data folder.
-- **Privacy:** traces go to LangSmith's servers, a third party. Owner's decision (2026-11-20): **extracted rows, no page images.** Traces keep the prompt, extracted rows (item names, amounts), timings, tokens, model, retries and errors. `scrub()` removes page images (base64 data URLs), all raw bytes, and the raw OCR text (dropped by key, and cut from the prompt at the OCR marker). The API traces only the URL's host and the upload's file extension, never the file name or full URL. Tests run with tracing forced off (`tests/conftest.py`). Retention follows the LangSmith plan.
+- **Privacy:** traces go to LangSmith's servers, a third party. Owner's decision (2026-11-20): **extracted rows, no page images**, revised 2026-11-21: **page images are opt-in** with `LANGSMITH_INCLUDE_IMAGES=true` (on in the developer's local `.env`, off by default and for the public demo). Traces keep the prompt, extracted rows (item names, amounts), timings, tokens, model, retries and errors. `scrub()` removes page images (base64 data URLs) unless that flag is on, in which case it sends a shrunk copy (max side 1200 px, JPEG quality 55) and the model still gets the original; all raw bytes, and the raw OCR text (dropped by key, and cut from the prompt at the OCR marker). The API traces only the URL's host and the upload's file extension, never the file name or full URL. Tests run with tracing forced off (`tests/conftest.py`). Retention follows the LangSmith plan.
 - **Limits:** the free LangSmith plan caps traces per month; check the current quota before enabling tracing on large runs, and sample evaluation runs if needed.
+
+## Self-hosted Comparison Endpoint
+
+Added 2026-11-21 at the owner's request: the Qwen endpoint used for the 2026-11-20 comparison was created on Modal's website, which picked the GPU and engine itself. We now deploy it from code so every setting is ours and versioned.
+- **File:** `serving/modal_vllm.py`. The folder is not called `modal/`, which would shadow the `modal` package. One Modal app, `bill-vlm`, with one web function that runs vLLM's OpenAI-compatible server (`/v1/chat/completions`, `/v1/models`, `/health`).
+- **Settings**, read from environment variables at deploy time and baked into the container so both sides agree:
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `SERVE_GPU` | `H100` (owner, 2026-11-21; the A100-80GB was too slow) | Modal GPU string, e.g. `L40S`, `A100-80GB`, `H100`, `H100:2`. The count after `:` sets vLLM's tensor parallelism |
+  | `SERVE_MODEL_ID` | `Qwen/Qwen3.6-35B-A3B` | Hugging Face model |
+  | `SERVE_MODEL_NAME` | `medical-bill` | Name clients send as `model` (same as the 2026-11-20 endpoint) |
+  | `SERVE_MAX_MODEL_LEN` | `32768` | Context length; two 200-DPI pages plus OCR text fit comfortably |
+  | `SERVE_MAX_CONTAINERS` | `1` | Spend cap: at most this many GPUs at once |
+  | `SERVE_SCALEDOWN_SECONDS` | `300` | Idle time after the last request before the GPU shuts down (billing stops); the next request starts it again automatically (owner, 2026-11-21) |
+  | `SERVE_ENFORCE_EAGER` | `0` | `1` skips torch.compile and CUDA-graph capture: about a minute faster per cold start, but measured 18 tokens/s on the A100 (2026-11-21), far too slow for eval runs. Off by default |
+
+  Fixed in code: vLLM pinned to `0.33.0`; scale to zero (`min_containers=0`); up to 8 concurrent requests per GPU; `--max-num-seqs 16` (vLLM's default 256 needs one Mamba cache block per sequence for CUDA-graph capture, and one A100-80GB has ~114, so startup crash-looped on 2026-11-21); at most 4 images per request.
+- **Weights** are cached in the Modal Volume `hf-cache`, so only the first start downloads them. `modal run serving/modal_vllm.py::download` fills it ahead of time without a GPU.
+- **Auth:** Modal proxy auth (`requires_proxy_auth=True`). Callers send `Modal-Key` / `Modal-Secret`, the same proxy-auth token already in `.env` (`TOKENID` / `TOKEN_SECRET`). No unauthenticated access.
+- **Client:** the `modal-vllm` backend in `eval/run_baseline.py` (`MODAL_VLLM_BASE_URL`, optional `MODAL_VLLM_MODEL`). It reuses `eval/backends.use_openai_compatible`, so prompt, images, OCR text and schema are identical to the Gemini run and a score difference is a model difference.
+- **Privacy:** same as the Gemini path: full bill pages leave the machine, here to the owner's Modal workspace. Nothing is stored there except model weights; vLLM keeps no request log.
+- **Scope:** offline comparisons only. The live app never calls this endpoint (Gemini is the live model).
 
 ## Auth and Access Model
 

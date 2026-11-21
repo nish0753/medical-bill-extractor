@@ -3,9 +3,12 @@
     python -m eval.run_baseline --out eval/outputs/baseline-legacy [--only 3 7] [--force] [--pause 20]
     python -m eval.run_baseline --out eval/outputs/cord-legacy --inputs ../EXTERNAL_DATASETS/cord/images
     python -m eval.run_baseline --out eval/outputs/qwen36-legacy --backend qwen-modal --budget-usd 15 --gpu-rate 6.25
+    python -m eval.run_baseline --out eval/outputs/qwen36-self --backend modal-vllm --budget-usd 10 --gpu-rate 4
 
 Backends: `gemini` (the app as it is) or `qwen-modal` (same pipeline, model call sent to a Modal endpoint;
-env TOKENID / TOKEN_SECRET (Modal proxy-auth token); QWEN_BASE_URL; optional QWEN_MODEL). See eval/backends.py.
+env TOKENID / TOKEN_SECRET (Modal proxy-auth token); QWEN_BASE_URL; optional QWEN_MODEL) or `modal-vllm`
+(our own deploy, serving/modal_vllm.py; same token; MODAL_VLLM_BASE_URL = the deploy URL + /v1; optional
+MODAL_VLLM_MODEL, default medical-bill). See eval/backends.py.
 --budget-usd stops the run once (elapsed time x --gpu-rate) passes the budget: a dedicated GPU endpoint
 bills for time while it is up, not per request.
 
@@ -81,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--inputs", type=Path, help="folder of PDFs/images to run instead of the 15 training samples")
     ap.add_argument("--force", action="store_true", help="re-run samples that already have an output")
     ap.add_argument("--pause", type=float, default=20.0, help="seconds between documents (free-tier rate limits)")
-    ap.add_argument("--backend", choices=("gemini", "qwen-modal"), default="gemini")
+    ap.add_argument("--backend", choices=("gemini", "qwen-modal", "modal-vllm"), default="gemini")
     ap.add_argument("--budget-usd", type=float, help="stop when elapsed time x --gpu-rate reaches this")
     ap.add_argument("--gpu-rate", type=float, default=0.0, help="USD per hour of the endpoint's GPU")
     args = ap.parse_args(argv)
@@ -101,18 +104,22 @@ def main(argv: list[str] | None = None) -> int:
         files = [PDFS / f"train_sample_{n}.pdf" for n in (args.only or range(1, 16))]
     # One event loop for the whole run, as in the API server: the old pipeline caches its Gemini client,
     # which is bound to the loop it was created on. A loop per document breaks every call after the first.
-    if args.backend == "qwen-modal":
+    if args.backend in ("qwen-modal", "modal-vllm"):
         from .backends import use_openai_compatible
 
+        url_var, model_var, hint = {
+            "qwen-modal": ("QWEN_BASE_URL", "QWEN_MODEL", "https://...modal.direct/v1"),
+            "modal-vllm": ("MODAL_VLLM_BASE_URL", "MODAL_VLLM_MODEL", "https://<workspace>--bill-vlm-serve.modal.run/v1"),
+        }[args.backend]
         key = os.getenv("MODAL_PROXY_KEY") or os.getenv("TOKENID")
         secret = os.getenv("MODAL_PROXY_SECRET") or os.getenv("TOKEN_SECRET")
-        if not (key and secret and os.getenv("QWEN_BASE_URL")):
-            print("Missing in .env: Modal proxy-auth token (TOKENID / TOKEN_SECRET) or QWEN_BASE_URL "
-                  "(the endpoint's https://...modal.direct/v1 address)")
+        if not (key and secret and os.getenv(url_var)):
+            print(f"Missing in .env: Modal proxy-auth token (TOKENID / TOKEN_SECRET) or {url_var} "
+                  f"(the endpoint's {hint} address)")
             return 1
         use_openai_compatible(
-            base_url=os.environ["QWEN_BASE_URL"],
-            model=os.getenv("QWEN_MODEL", "medical-bill"),
+            base_url=os.environ[url_var],
+            model=os.getenv(model_var, "medical-bill"),
             headers={"Modal-Key": key.strip(), "Modal-Secret": secret.strip()},
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )

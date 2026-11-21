@@ -11,5 +11,6 @@ def _no_langsmith_tracing():
     from app import extractor, tracing  # noqa: F401
 
     os.environ["LANGSMITH_TRACING"] = "false"
+    os.environ.pop("LANGSMITH_INCLUDE_IMAGES", None)  # masking tests assume the default (images dropped)
     tracing.setup()
     yield

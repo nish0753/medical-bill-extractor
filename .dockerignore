@@ -19,3 +19,4 @@ tests/
 .gemini/
 .venv/
 eval/
+serving/

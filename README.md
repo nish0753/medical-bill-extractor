@@ -103,6 +103,8 @@ Set in `.env` or the environment.
 | `LANGSMITH_ENDPOINT` | | `https://api.smith.langchain.com` | LangSmith API |
 | `LANGSMITH_AGENT_ID` | for tracing | — | `medical-bill-extractor` |
 | `LANGSMITH_AGENT_ENVIRONMENT` | for tracing | — | `local`, `development`, `staging` or `production` |
+| `LANGSMITH_INCLUDE_IMAGES` | | `false` | `true` adds a small copy of each page image to traces |
+| `MODAL_VLLM_BASE_URL` | for model comparisons | — | Self-hosted model endpoint (see `serving/`) |
 
 Don't set `LANGSMITH_PROJECT` together with the agent variables; LangSmith then records nothing.
 
@@ -110,7 +112,7 @@ Don't set `LANGSMITH_PROJECT` together with the agent variables; LangSmith then 
 
 Each request produces one LangSmith trace: the API call, page rendering, OCR, every Gemini call (model, retries, tokens, latency) and the extracted rows.
 
-Bills contain patient data, so all tracing goes through [`app/tracing.py`](app/tracing.py), which removes page images, file bytes and raw OCR text before anything leaves the machine. File names and full document URLs are never traced. If LangSmith is unreachable, requests run normally.
+Bills contain patient data, so all tracing goes through [`app/tracing.py`](app/tracing.py), which removes file bytes and raw OCR text before anything leaves the machine. Page images are left out too, unless `LANGSMITH_INCLUDE_IMAGES=true`; then a downscaled copy is sent (about 9× smaller), while Gemini still gets the full page. File names and full document URLs are never traced. If LangSmith is unreachable, requests run normally.
 
 ## Evaluation
 
@@ -120,6 +122,43 @@ The `eval/` harness compares the pipeline's output with a hand-made answer key a
 python -m eval.run_baseline --out eval/outputs/my-run          # run the pipeline on the samples
 python -m eval.run_eval --outputs eval/outputs/my-run --format legacy --label my-run --compare
 ```
+
+## Results
+
+Measured on 15 hand-checked bills (50 pages). "Dev" is the 10 bills used for tuning; scores are from the current pipeline, with only the model or OCR engine swapped.
+
+### Which model reads bills best?
+
+| Dev split | Gemini 2.5 Flash | Qwen3.6-35B-A3B (self-hosted) |
+|---|---|---|
+| Lines found | 93.3% | 90.7% |
+| Lines correct (precision) | 96.7% | 99.4% |
+| Amounts exactly right | 97.1% | 99.7% |
+| Bills fully correct | 5 of 10 | 6 of 10 |
+| Time for all 15 bills | 17 min + quota waits | 11 min |
+| Cost | free tier | about $1 (Modal H100) |
+
+On 86 out-of-domain receipts (CORD) the self-hosted Qwen finds 83.9% of lines.
+
+### Fixing page numbers
+
+Pages are sent to the model in batches, and each batch used to number its pages from 1. The pipeline now assigns the real page number itself.
+
+| Lines found, page number must be right | Before | After |
+|---|---|---|
+| Qwen3.6-35B-A3B | 45.7% | 90.7% |
+
+### Which OCR reads the amounts?
+
+Share of the answer key's amounts that appear in the OCR text of the right page.
+
+| OCR engine | Amounts found (dev) | Seconds per page |
+|---|---|---|
+| RapidOCR, PP-OCRv5 server models (CPU) | 99.1% | 29 |
+| PaddleOCR, PP-OCRv5 server models (GPU) | 97.1% | 1.6 |
+| Tesseract (used today) | 91.0% | 1.6 |
+
+Reports are written to `eval/reports/` (kept out of git because they quote real bill lines). To rerun: `python -m eval.ocr_bench --help` for OCR, and the commands under Evaluation for models.
 
 ## Tests
 
@@ -136,7 +175,8 @@ app/
   extractor.py     extraction pipeline (render, OCR, Gemini, merge)
   tracing.py       LangSmith tracing and data masking
   schemas.py       response models
-eval/              answer-key scorer, baseline runner, dataset converters
+eval/              answer-key scorer, baseline runner, OCR benchmark, dataset converters
+serving/           Modal GPU scripts for comparison models (vLLM, PaddleOCR); never called by the app
 tests/             API, pipeline, tracing and scorer tests
 docs/context/      design docs: overview, architecture, low-level design, progress
 ```

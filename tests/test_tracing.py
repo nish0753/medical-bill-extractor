@@ -32,6 +32,40 @@ class TestScrub:
         assert "Extract rows." in text and "CBC" in text and "240.0" in text
         assert "<image omitted>" in text and "<OCR text omitted>" in text
 
+    def test_include_images_keeps_image_but_still_drops_ocr_and_bytes(self, monkeypatch):
+        monkeypatch.setenv("LANGSMITH_INCLUDE_IMAGES", "true")
+        data = {
+            "file_data": b"%PDF-1.7 ...",
+            "pages": [{"page_no": 1, "media_payload": ("image/jpeg", b"\xff\xd8"), "ocr_context": OCR_SECRET}],
+            "messages": [[{"content": [
+                {"type": "image_url", "image_url": f"data:image/jpeg;base64,{PIXELS}"},
+                {"type": "text", "text": f"Extract rows.\n=== RAW OCR TEXT CONTEXT ===\n{OCR_SECRET}"},
+            ]}]],
+        }
+        text = json.dumps(tracing.scrub(data))
+        assert PIXELS not in text  # not a real image: dropped, never sent as-is
+        assert "<image omitted: could not shrink>" in text
+        assert OCR_SECRET not in text and "%PDF" not in text
+
+    def test_included_images_are_shrunk(self, monkeypatch):
+        import base64
+        import io
+        import random
+
+        monkeypatch.setenv("LANGSMITH_INCLUDE_IMAGES", "true")
+        rng = random.Random(0)
+        page = Image.new("RGB", (1700, 2200), "white")  # A4 at 200 DPI
+        page.putdata([(v, v, v) for v in (rng.randrange(256) for _ in range(1700 * 2200))])
+        buf = io.BytesIO()
+        page.save(buf, format="JPEG", quality=95)
+        original = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        traced = tracing.scrub({"image_url": original})["image_url"]
+        assert traced.startswith("data:image/jpeg;base64,")
+        assert len(traced) < len(original) / 3
+        with Image.open(io.BytesIO(base64.b64decode(traced.split(",", 1)[1]))) as img:
+            assert max(img.size) == tracing.TRACE_IMAGE_MAX_SIDE
+
     def test_masked_never_raises_and_drops_payload_on_failure(self, monkeypatch):
         monkeypatch.setattr(tracing, "scrub", lambda _d: 1 / 0)
         assert tracing.masked({"x": "y"}) == {"note": "<payload dropped: scrub failed>"}

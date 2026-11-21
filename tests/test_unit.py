@@ -160,6 +160,55 @@ class TestLangGraphBatchAggregation:
         assert calls[1][0] == 1
         assert len(result["pagewise_line_items"]) == 3
         assert result["total_item_count"] == 3
+        assert [p["page_no"] for p in result["pagewise_line_items"]] == ["1", "2", "3"]
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 3, 5])
+    @pytest.mark.parametrize("numbering", ["relative", "absolute", "always_one"])
+    def test_page_numbers_are_physical_for_any_batch_size(self, monkeypatch, batch_size, numbering):
+        total_pages = 5
+
+        def fake_convert_from_bytes(_file_data, dpi):
+            return [Image.new("RGB", (20, 20), color="white") for _ in range(total_pages)]
+
+        next_page = {"value": 1}
+
+        async def fake_call_gemini_api_async(media_payloads, ocr_context=""):
+            entries = []
+            for rel in range(1, len(media_payloads) + 1):
+                physical = next_page["value"]
+                next_page["value"] += 1
+                label = {"relative": rel, "absolute": physical, "always_one": 1}[numbering]
+                entries.append({
+                    "page_no": str(label),
+                    "page_type": "Bill Detail",
+                    "bill_items": [{"item_name": f"item-p{physical}", "item_amount": 1, "item_rate": 1, "item_quantity": 1}],
+                })
+            return {"pagewise_line_items": entries, "total_item_count": len(entries)}
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        monkeypatch.setattr(extractor, "pytesseract", None)
+        monkeypatch.setattr(extractor, "BATCH_SIZE", batch_size)
+        monkeypatch.setattr(extractor, "convert_from_bytes", fake_convert_from_bytes)
+        monkeypatch.setattr(extractor, "call_gemini_api_async", fake_call_gemini_api_async)
+        monkeypatch.setattr(extractor, "_workflow", None)
+
+        result = asyncio.run(extractor.extract_bill_data(b"%PDF-1.7 mocked", mime_type="application/pdf"))
+        pages = result["pagewise_line_items"]
+
+        assert [p["page_no"] for p in pages] == [str(n) for n in range(1, total_pages + 1)]
+        for page in pages:
+            assert page["bill_items"][0]["item_name"] == f"item-p{page['page_no']}"
+
+    def test_resolve_page_no(self):
+        resolve = extractor._resolve_page_no
+        assert resolve("1", [5], 0) == 5            # single page: always the physical page
+        assert resolve("9", [5], 0) == 5
+        assert resolve("1", [3, 4], 0) == 3         # relative
+        assert resolve("2", [3, 4], 1) == 4
+        assert resolve("4", [3, 4], 1) == 4         # absolute
+        assert resolve("Page 2", [3, 4], 0) == 4    # noisy label
+        assert resolve("", [3, 4], 1) == 4          # unparsable: falls back to position
+        assert resolve("99", [3, 4], 5) == 4        # out of range: clamped to the batch
 
 
 class TestGeminiRetryBehavior:

@@ -37,6 +37,8 @@ python -m eval.run_eval --outputs eval/outputs/<run> --format legacy --label <na
 
 The `dev`/`test` split is in `eval/splits.yaml`. Only inspect individual failures on `dev`; the `test` split is for aggregate scores at milestone ends.
 
+Comparison model on Modal (offline only, never called by `app/`): `SERVE_GPU=<gpu> modal deploy serving/modal_vllm.py`, then `python -m eval.run_baseline --backend modal-vllm ...`. See `architecture.md`, Self-hosted Comparison Endpoint.
+
 Docker: the image runs uvicorn on port 10000. `render.yaml` deploys it to Render and expects `GOOGLE_API_KEY` to be set there.
 
 ## Configuration

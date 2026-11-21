@@ -12,6 +12,9 @@
 | Rebuild answer key v2 | `python -m eval.migrate_answer_key` (`--check` validates without writing) |
 | Run the old pipeline on all samples | `python -m eval.run_baseline --out eval/outputs/<run>` (needs `GOOGLE_API_KEY`; resumable) |
 | Evaluate against the answer key | `python -m eval.run_eval --outputs eval/outputs/<run> --format legacy\|contract --label <name> --compare` (exit code 2 = regression) |
+| Deploy the comparison model | `SERVE_GPU=<gpu> modal deploy serving/modal_vllm.py` (`modal serve` for a temporary dev URL; `modal run serving/modal_vllm.py::download` to pre-fetch weights). Uses the `modal` CLI, not the project `.venv` |
+| Run the pipeline against it | `python -m eval.run_baseline --out eval/outputs/<run> --backend modal-vllm --budget-usd <usd> --gpu-rate <usd/hour>` |
+| OCR benchmark | `python -m eval.ocr_bench render`, then `modal run serving/modal_paddleocr.py --pages eval/outputs/ocr-bench/pages --out eval/outputs/ocr-bench/paddleocr.json`, then `python -m eval.ocr_bench score` |
 | Lint / format | None configured yet |
 | Build | `docker build .` |
 
@@ -60,3 +63,4 @@
 - `app/`: service code (API, pipeline stages, checks).
 - `tests/`: pytest suite mirroring the `app/` modules.
 - `docs/context/`: context files (this folder).
+- `serving/`: Modal deploy scripts for comparison models; no imports from `app/`.

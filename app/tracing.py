@@ -5,12 +5,17 @@ LANGSMITH_API_KEY is set. When it is on:
 - `setup()` installs one global LangSmith client whose inputs and outputs pass through `scrub()`. The
   same client is used by LangChain/LangGraph's automatic traces (the Gemini call and the graph nodes) and
   by our own `span()`s, so nothing reaches LangSmith unscrubbed.
-- `scrub()` keeps prompts, extracted rows, timings, tokens and errors. It drops page images, raw file
-  bytes and the raw OCR text (owner's decision, 2026-11-20: "extracted rows, no page images").
+- `scrub()` keeps prompts, extracted rows, timings, tokens and errors. It drops raw file bytes and the
+  raw OCR text. Page images sent to the model (base64 data URLs) are dropped too, unless
+  LANGSMITH_INCLUDE_IMAGES=true (owner's decision, 2026-11-21: images opt-in; off by default). Traced
+  images are a downscaled, low-quality copy so traces load quickly; the model gets the original.
 - Tracing fails open: if LangSmith is down or misconfigured, requests run exactly as without it.
 """
 from __future__ import annotations
 
+import base64
+import functools
+import io
 import logging
 import os
 from contextlib import contextmanager
@@ -33,6 +38,35 @@ def is_enabled() -> bool:
     return _enabled
 
 
+def include_images() -> bool:
+    """Read at call time so the flag can be flipped without re-importing (and in tests)."""
+    return _truthy(os.getenv("LANGSMITH_INCLUDE_IMAGES"))
+
+
+TRACE_IMAGE_MAX_SIDE = 1200  # px; enough to read a bill line, far smaller than the 200-DPI page
+TRACE_IMAGE_QUALITY = 55  # JPEG quality for the traced copy only
+
+
+@functools.lru_cache(maxsize=32)
+def _shrink_data_url(data_url: str) -> str:
+    """Downscale and recompress an image data URL for the trace. The model still gets the original.
+
+    Cached because the same image appears in several runs of one trace (span, chain, chat model).
+    """
+    try:
+        from PIL import Image
+
+        raw = base64.b64decode(data_url.split(";base64,", 1)[1])
+        with Image.open(io.BytesIO(raw)) as img:
+            img = img.convert("L" if img.mode in ("L", "LA", "1") else "RGB")
+            img.thumbnail((TRACE_IMAGE_MAX_SIDE, TRACE_IMAGE_MAX_SIDE))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=TRACE_IMAGE_QUALITY, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception:  # never send an image we couldn't process
+        return "<image omitted: could not shrink>"
+
+
 def scrub(data: Any, _depth: int = 0) -> Any:
     """Return a copy of a trace payload without page images, file bytes or raw OCR text."""
     if _depth > _MAX_DEPTH:
@@ -41,7 +75,7 @@ def scrub(data: Any, _depth: int = 0) -> Any:
         return f"<{len(data)} bytes omitted>"
     if isinstance(data, str):
         if data.startswith("data:") and ";base64," in data[:100]:
-            return "<image omitted>"
+            return _shrink_data_url(data) if include_images() else "<image omitted>"
         if OCR_MARKER in data:
             return data[: data.index(OCR_MARKER)] + f"{OCR_MARKER}\n<OCR text omitted>"
         return data

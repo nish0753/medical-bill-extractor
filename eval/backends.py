@@ -53,7 +53,10 @@ def use_openai_compatible(base_url: str, model: str, headers: dict[str, str], ex
 
     base_prompt = _legacy_prompt()
     schema = extractor.LLMExtractionOutput.model_json_schema()
-    client = httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout)
+    # follow_redirects: Modal answers requests that run past ~150 s (e.g. during a cold start) with a 303 to
+    # a URL that waits for the result. Without following it the call fails although the model is fine.
+    client = httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout,
+                               follow_redirects=True)
 
     async def call(media_payloads: list[tuple[str, bytes]], ocr_context: str = "") -> dict[str, Any]:
         prompt = base_prompt + (f"\n\n=== RAW OCR TEXT CONTEXT ===\n{ocr_context}" if ocr_context else "")
