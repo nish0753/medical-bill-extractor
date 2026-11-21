@@ -188,4 +188,4 @@ The redesign is specified in [`docs/context/`](docs/context/) and tracked in [`p
 - every printed line returned with a role (billable, summary or breakdown), so totals never double-count;
 - per-line source locations and confidence, checked against OCR text and the bill's own totals;
 - async jobs for long bills, and a review page for flagged documents;
-- a public demo on Hugging Face Spaces.
+- a public demo (live on Render today).

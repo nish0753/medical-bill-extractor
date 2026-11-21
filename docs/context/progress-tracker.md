@@ -69,7 +69,7 @@ Milestones:
 
 - ~~GPU for the self-hosted comparison endpoint~~ Resolved 2026-11-21: the owner chose 1× A100-80GB (default `SERVE_GPU` in `serving/modal_vllm.py`).
 
-- Production auto-scaling: deferred. The public demo goes on Hugging Face Spaces (decided 2026-11-20); revisit real production hosting after M6. The current `render.yaml` won't suit the SQLite + local files setup (Render's free plan has no persistent disk). The planned scaling path is in `architecture.md`, Scaling Path.
+- Production auto-scaling: deferred. The public demo is the live Render service (decided 2026-11-21); revisit real production hosting after M6. **Before M4:** Render's free plan has no persistent disk, so the redesign's SQLite queue and local folders would be wiped on every restart or deploy. Options: a paid Render disk, an external store (e.g. a hosted Postgres and object storage), or accept losing in-flight jobs on the demo. The planned scaling path is in `architecture.md`, Scaling Path.
 - Maximum file size and page count per job (today's limit is 20 MB).
 - **Public demo quota.** Gemini is the live model and the demo will be shown to interviewers, but the free tier allows 20 requests per model per day (about 4 ten-page bills). Options: enable paid Gemini with a budget alert (recommended; roughly ₹1–3 per 10-page bill), or stay free and show a clear "daily demo limit" message.
 - GPT-OSS-120B on Groq (owner asked, 2026-11-20): text-only, so it can't replace Gemini for reading page images. Free plan: 30 requests/min, 1,000/day, 8K tokens/min, 200K tokens/day (Groq docs table). Candidate for stage 9 (second reading works on OCR text only), where a different model family also removes the correlated-errors concern. Decide in M3.
@@ -93,7 +93,7 @@ Milestones:
 - **Free-tier Gemini only; free local OCR.** Why: the owner requires zero model cost. (Under review for the public demo: see the quota open question.)
 - **Gemini is the live model** (2026-11-20). Why: the owner's choice for the deployed demo. Qwen on Modal stays an offline comparison backend only.
 - **Comparison models are deployed from our own script (2026-11-21).** Why: the Modal-website endpoint chose GPU and engine itself; the owner wants control. `serving/modal_vllm.py` (vLLM, settings by env var, proxy-auth), client backend `modal-vllm`. See `architecture.md`, Self-hosted Comparison Endpoint.
-- **Public demo on Hugging Face Spaces** (2026-11-20). Why: free, no card, a permanent link an interviewer can open; runs the existing Dockerfile.
+- **Public demo on Render** (2026-11-21, replaces the 2026-11-20 Hugging Face Spaces plan). Why: it is already live there, with tracing to the LangSmith `production` environment; no second deployment needed.
 - **LangSmith tracing now, rows but no page images** (2026-11-20). Why: the owner wants every trace in LangSmith; images and raw OCR text stay out to limit patient data in a third-party service.
 - **Full pages are sent to the free tier, privacy risk accepted.** Why: the owner's choice. Redaction was offered and declined.
 - **Async jobs, accuracy first.** Why: bills run to 90+ pages, and free-tier rate limits need queueing.
